@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
 # ═══════════════════════════════════════════════════
 # Кириллица: принудительный UTF-8
@@ -73,7 +73,7 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         $scriptPath = Join-Path $InstallDir 'goodwin_obs.ps1'
         $scriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
-        [IO.File]::WriteAllText($scriptPath, $scriptContent, [Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText($scriptPath, $scriptContent, (New-Object System.Text.UTF8Encoding($true)))
     }
     if (Test-Path $scriptPath) {
         Start-Process powershell.exe -WindowStyle Minimized -ArgumentList '-STA','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`""
