@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
 # ═══════════════════════════════════════════════════
 # Кириллица: принудительный UTF-8
@@ -91,12 +91,14 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 # раздачи скрипта лучше вынести OAuth-секреты и refresh token на сервер.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Dropbox: данные приложения. Refresh token не хранится в репозитории автоматически,
-# потому что authorization code одноразовый и быстро истёк; вставьте свежий refresh token
-# после обмена нового code с token_access_type=offline.
-$DropboxAppKey = '9bk915fn1x1g9y6'
-$DropboxAppSecret = 'q1gc4teu5fkpe7n'
-$DropboxRefreshToken = 'A4Zj4weiG5EAAAAAAAAAAUt3qoJsM3tTip2vblxsXeItSnf6gcrVfwPqUIy10uI6'
+# Dropbox OAuth: значения зашифрованы и расшифровываются ключом из GOODWIN_OBS_KEY.
+$script:DropboxOAuthEncrypted = @{
+    k = 'v1:e4lHo3yR7K+epx0VWmli+Q==:LCWV7f4lquLsxhNQckm6kQ==:uWbp9RS6lMSrwibtodMPhQ=='
+    s = 'v1:xXugp2z9JVGHXuGEeo0SNQ==:YfFlAXKN1cjZ5ks+0isK4A==:pWV7bOiPNoKEs4eVusFZOw=='
+    c = 'v1:D3k7njsW/PkQjrUO87EJcw==:FNnkaQ4maIYRHoB9QM0i+A==:phEZY2DAf8G5Oz8qnA7jGaWdBXfXT/mPOoXjFYU5a90Unz9GKSE1nqxcezO6+tuH'
+}
+$script:DropboxOAuthConfig = $null
+$script:DropboxRuntimeRefreshToken = $null
 $DropboxUploadFolderPath = '/Goodwin'
 
 # ── Пути установки, записи и локального хранилища ────────────────────────────
@@ -105,6 +107,7 @@ $script:RecordingRoot     = Join-Path $env:USERPROFILE 'Downloads\goodwin_record
 $script:RecordingDir      = $script:RecordingRoot
 $script:SettingsFile      = Join-Path $env:APPDATA 'goodwin_obs\settings.json'
 $script:UploadHistoryFile = Join-Path $env:APPDATA 'goodwin_obs\uploaded.json'
+$script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
 $script:UploadProgressActive = $false
 $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
 $TempRoot = Join-Path $InstallDir '.tmp_install'
@@ -957,40 +960,78 @@ blBLAQIUABQAAAAIAAqM3lwM9X+KPwAAAEIAAAAkAAAAAAAAAAAAAAAAALcnAABudmlkaWFfbWVkaXVt
 ABwAHADrBwAAOCgAAAAA
 '@
 
-# Многострочный блок прогресса: одна строка на каждый параллельно загружаемый файл,
-# обновляется на месте (без появления новых строк в логе при каждом тике).
+# Прогресс загрузки: одна строка состояния на каждый параллельно загружаемый
+# файл в памяти; агрегированный прогресс выводится в нижнюю строку состояния.
 # $script:MultiProgressState: [ordered]@{ FileName -> @{ Uploaded; Total; Status } }
-# $script:MultiProgressLineCount: сколько строк сейчас занимает блок (для атомарного удаления)
 $script:MultiProgressState = $null
 $script:MultiProgressLineCount = 0
+$script:RecentActivity = New-Object System.Collections.Generic.List[string]
+
+function Add-LogFileLine {
+    param([string] $Line)
+    try {
+        $dir = Split-Path -Parent $script:LogFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+        Add-Content -Path $script:LogFile -Value $Line -Encoding UTF8
+    }
+    catch {
+        # Лог не должен ломать основную работу приложения.
+    }
+}
+
+function Format-UiText {
+    param([string] $Text, [int] $MaxLength = 92)
+    if ($null -eq $Text) { return '' }
+    $clean = ($Text -replace '\s+', ' ').Trim()
+    if ($clean.Length -le $MaxLength) { return $clean }
+    return ($clean.Substring(0, [math]::Max(0, $MaxLength - 3)) + '...')
+}
+
+function Refresh-ActivityUi {
+    if (-not $script:ActivityLabels) { return }
+    for ($i = 0; $i -lt $script:ActivityLabels.Count; $i++) {
+        $label = $script:ActivityLabels[$i]
+        if (-not $label) { continue }
+        if ($i -lt $script:RecentActivity.Count) {
+            $label.Text = Format-UiText $script:RecentActivity[$i] 86
+            $label.ForeColor = if ($i -eq 0) {
+                [System.Drawing.Color]::FromArgb(238, 242, 247)
+            } else {
+                [System.Drawing.Color]::FromArgb(154, 164, 178)
+            }
+        } else {
+            $label.Text = ''
+        }
+    }
+}
+
+function Add-ActivityItem {
+    param([string] $Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    $script:RecentActivity.Insert(0, $Message)
+    while ($script:RecentActivity.Count -gt 6) {
+        $script:RecentActivity.RemoveAt($script:RecentActivity.Count - 1)
+    }
+    Refresh-ActivityUi
+}
+
+function Set-UploadProgressUi {
+    param(
+        [int] $Percent,
+        [string] $Title,
+        [string] $Detail,
+        [string[]] $Rows
+    )
+
+    $text = "{0}: {1}% — {2}" -f $Title, ([math]::Min(100, [math]::Max(0, $Percent))), $Detail
+    $color = if ($Percent -ge 100) { 'Green' } else { 'Yellow' }
+    Set-Status (Format-UiText $text 132) $color
+    try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+}
 
 function Clear-UploadProgress {
-    if (-not $script:LogBox -or -not $script:LogBox.IsHandleCreated) {
-        $script:UploadProgressActive = $false
-        $script:MultiProgressLineCount = 0
-        $script:MultiProgressState = $null
-        return
-    }
-    if ($script:MultiProgressLineCount -le 0) {
-        $script:UploadProgressActive = $false
-        $script:MultiProgressState = $null
-        return
-    }
-    $text = $script:LogBox.Text
-    if ($text.Length -gt 0) {
-        # Снимаем все trailing \r\n, затем срезаем N последних строк блока.
-        $trimmed = $text.TrimEnd("`r","`n")
-        $idx = $trimmed.Length
-        for ($i = 0; $i -lt $script:MultiProgressLineCount; $i++) {
-            $idx = $trimmed.LastIndexOf("`n", [math]::Max(0, $idx - 1))
-            if ($idx -lt 0) { $idx = -1; break }
-        }
-        $start = if ($idx -lt 0) { 0 } else { $idx + 1 }
-        $script:LogBox.Select($start, $script:LogBox.TextLength - $start)
-        $script:LogBox.SelectedText = ''
-        $script:LogBox.SelectionStart = $script:LogBox.TextLength
-        try { $script:LogBox.ScrollToCaret() } catch {}
-    }
     $script:MultiProgressLineCount = 0
     $script:MultiProgressState = $null
     $script:UploadProgressActive = $false
@@ -1011,32 +1052,24 @@ function Write-Step {
     param([string] $Message)
     $ts = Get-Date -Format 'HH:mm:ss'
     $line = "[$ts] $Message"
-    if ($script:LogBox) {
-        if ($script:UploadProgressActive) { Clear-UploadProgress }
-        $script:LogBox.AppendText($line + "`r`n")
-        if ($script:LogBox.IsHandleCreated) {
-            $script:LogBox.SelectionStart = $script:LogBox.TextLength
-            $script:LogBox.SelectionLength = 0
-            try { $script:LogBox.ScrollToCaret() } catch {}
-        }
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-    else {
-        Write-Host "[goodwin_obs] $Message"
-    }
+    Write-Host "[goodwin_obs] $Message"
+    Add-LogFileLine $line
+    Add-ActivityItem $Message
+    try { [System.Windows.Forms.Application]::DoEvents() } catch {}
 }
 
-# Технический лог — пишется ТОЛЬКО в консоль PowerShell, не в GUI.
+# Технический лог — пишется в файл и консоль PowerShell, не в основной GUI.
 # Используется внутри install/setup функций, чтобы не засорять интерфейс.
 function Write-Log {
     param([string] $Message)
     $ts = Get-Date -Format 'HH:mm:ss'
-    Write-Host "[$ts] $Message"
+    $line = "[$ts] $Message"
+    Write-Host $line
+    Add-LogFileLine $line
 }
 
-# Подробный отчёт об ошибке — выводит в GUI красным цветом многострочный блок,
-# который можно выделить и скопировать (вместе со стеком и InnerException).
-# Также дублируется в консоль PowerShell.
+# Подробный отчёт об ошибке пишется в файл и консоль. В интерфейсе остаётся
+# короткая понятная строка, полный блок доступен через кнопку «Логи».
 function Write-ErrorDetails {
     param(
         [string] $Context,
@@ -1078,127 +1111,71 @@ function Write-ErrorDetails {
         $shown = $lines | Select-Object -First 12
         [void]$sb.AppendLine('Стек:')
         foreach ($ln in $shown) { [void]$sb.AppendLine('  ' + $ln.Trim()) }
-        if ($lines.Count -gt 12) { [void]$sb.AppendLine("  …ещё $($lines.Count - 12) строк (см. PowerShell-консоль)") }
+        if ($lines.Count -gt 12) { [void]$sb.AppendLine("  …ещё $($lines.Count - 12) строк (см. файл логов)") }
     }
     [void]$sb.AppendLine('═══════════════════════════════════════')
     $text = $sb.ToString().TrimEnd()
 
-    # Дублируем в консоль (полный стек, без обрезки)
+    Add-LogFileLine ''
+    Add-LogFileLine $text
+    if ($ex -and $ex.StackTrace) { Add-LogFileLine $ex.StackTrace }
+    Add-LogFileLine ''
+
     Write-Host ''
     Write-Host $text -ForegroundColor Red
     if ($ex -and $ex.StackTrace) { Write-Host $ex.StackTrace -ForegroundColor DarkGray }
     Write-Host ''
 
-    # И выводим в GUI красным
-    if ($script:LogBox -and $script:LogBox.IsHandleCreated) {
-        if ($script:UploadProgressActive) { Clear-UploadProgress }
-        $red = [System.Drawing.Color]::FromArgb(230, 90, 90)
-        $normal = [System.Drawing.Color]::FromArgb(210, 210, 210)
-        $script:LogBox.SelectionStart  = $script:LogBox.TextLength
-        $script:LogBox.SelectionLength = 0
-        $script:LogBox.SelectionColor  = $red
-        $script:LogBox.AppendText($text + "`r`n")
-        $script:LogBox.SelectionColor  = $normal
-        $script:LogBox.SelectionStart  = $script:LogBox.TextLength
-        try { $script:LogBox.ScrollToCaret() } catch {}
-        [System.Windows.Forms.Application]::DoEvents()
-    }
+    Add-ActivityItem ("Ошибка: " + $(if ($Context) { $Context } else { $ex.Message }))
 }
 
 $script:LastMultiRenderTicks = 0
 
 function Update-MultiProgressRender {
-    # Перерисовывает весь блок прогресса (N строк) на месте, не плодя новых строк.
+    # Обновляет агрегированный прогресс загрузки в нижней строке состояния.
     param([switch] $Force)
-    if (-not $script:LogBox -or -not $script:LogBox.IsHandleCreated) { return }
     if (-not $script:MultiProgressState -or $script:MultiProgressState.Count -eq 0) { return }
 
-    # Троттлинг: при частых обновлениях (заливка блоками по 1 МБ) перерисовка на КАЖДЫЙ
-    # тик заставляет лог «дёргаться». Активные тики рисуем не чаще ~7 раз/сек; обязательные
-    # кадры (init/done/error) идут через -Force и не троттлятся.
     if (-not $Force) {
         if ($null -eq $script:LastMultiRenderTicks) { $script:LastMultiRenderTicks = 0 }
         if (([Environment]::TickCount - $script:LastMultiRenderTicks) -lt 140) { return }
     }
     $script:LastMultiRenderTicks = [Environment]::TickCount
 
-    # Замораживаем перерисовку контрола на время правки (WM_SETREDRAW=0): удаление старого
-    # блока и вставка нового видны как ОДИН кадр — без мерцания и дёрганья.
-    $froze = $false
-    try { [ConsoleHelper]::SendMessage($script:LogBox.Handle, 0x000B, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; $froze = $true } catch {}
+    $totalAll = 0L
+    $upAll    = 0L
+    $doneCnt  = 0
+    $errorCnt = 0
+    $rows = New-Object System.Collections.Generic.List[string]
 
-    try {
-        # Удаляем предыдущий блок (если был)
-        if ($script:MultiProgressLineCount -gt 0) {
-            $text = $script:LogBox.Text
-            $trimmed = $text.TrimEnd("`r","`n")
-            $idx = $trimmed.Length
-            for ($i = 0; $i -lt $script:MultiProgressLineCount; $i++) {
-                $idx = $trimmed.LastIndexOf("`n", [math]::Max(0, $idx - 1))
-                if ($idx -lt 0) { $idx = -1; break }
-            }
-            $start = if ($idx -lt 0) { 0 } else { $idx + 1 }
-            # RichTextBox в ReadOnly пищит (MessageBeep) на программном удалении текста
-            # (SelectedText=''). Снимаем ReadOnly на момент правки и возвращаем обратно.
-            $reLock = $script:LogBox.ReadOnly
-            if ($reLock) { $script:LogBox.ReadOnly = $false }
-            $script:LogBox.Select($start, $script:LogBox.TextLength - $start)
-            $script:LogBox.SelectedText = ''
-            if ($reLock) { $script:LogBox.ReadOnly = $true }
-        }
+    foreach ($name in $script:MultiProgressState.Keys) {
+        $st = $script:MultiProgressState[$name]
+        $u = [long]$st.Uploaded
+        $t = [long]$st.Total
+        $totalAll += $t
+        $upAll    += $u
+        if ($st.Status -eq 'done')  { $doneCnt++ }
+        if ($st.Status -eq 'error') { $doneCnt++; $errorCnt++ }
 
-        # Считаем агрегированный прогресс для status label
-        $totalAll = 0L
-        $upAll    = 0L
-        $doneCnt  = 0
-        foreach ($name in $script:MultiProgressState.Keys) {
-            $st = $script:MultiProgressState[$name]
-            $totalAll += [long]$st.Total
-            $upAll    += [long]$st.Uploaded
-            if ($st.Status -eq 'done' -or $st.Status -eq 'error') { $doneCnt++ }
+        $pct = if ($t -gt 0) { [math]::Min(100, [math]::Floor($u * 100.0 / $t)) } else { 0 }
+        $tag = switch ($st.Status) {
+            'done'  { 'Готово' }
+            'error' { 'Ошибка' }
+            default { 'Загрузка' }
         }
-        $aggPct = if ($totalAll -gt 0) { [math]::Min(100, [math]::Floor($upAll * 100.0 / $totalAll)) } else { 0 }
-        if ($script:StatusLabel_ref) {
-            $script:StatusLabel_ref.Text = "⚠ НЕ ЗАКРЫВАЙТЕ ОКНО! Загрузка ($doneCnt/$($script:MultiProgressState.Count)): $aggPct%"
-        }
-
-        # Рендерим блок
-        $barWidth = 30
-        $lines = New-Object System.Collections.Generic.List[string]
-        foreach ($name in $script:MultiProgressState.Keys) {
-            $st = $script:MultiProgressState[$name]
-            $u = [long]$st.Uploaded
-            $t = [long]$st.Total
-            $pct = if ($t -gt 0) { [math]::Min(100, [math]::Floor($u * 100.0 / $t)) } else { 0 }
-            $filled = [int][math]::Floor($barWidth * $pct / 100.0)
-            if ($filled -lt 0) { $filled = 0 } elseif ($filled -gt $barWidth) { $filled = $barWidth }
-            $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
-            $uMb = [math]::Round($u / 1MB, 1)
-            $tMb = [math]::Round($t / 1MB, 1)
-            $short = if ($name.Length -gt 28) { '...' + $name.Substring($name.Length - 25) } else { $name }
-            $tag = switch ($st.Status) {
-                'done'    { '✓' }
-                'error'   { '✗' }
-                default   { ' ' }
-            }
-            $lines.Add(("  {0} [{1}] {2,3}%  ({3,7:N1} / {4,7:N1} МБ)  {5}" -f $tag, $bar, $pct, $uMb, $tMb, $short))
-        }
-        $block = ($lines -join "`r`n") + "`r`n"
-        $script:LogBox.SelectionStart = $script:LogBox.TextLength
-        $script:LogBox.AppendText($block)
-        $script:MultiProgressLineCount = $lines.Count
-    }
-    finally {
-        # Размораживаем перерисовку и просим один полный repaint.
-        if ($froze) {
-            try { [ConsoleHelper]::SendMessage($script:LogBox.Handle, 0x000B, [IntPtr]1, [IntPtr]::Zero) | Out-Null } catch {}
-            try { $script:LogBox.Invalidate() } catch {}
-        }
+        $rows.Add(("{0}%  {1}  {2}" -f $pct, $tag, $name))
     }
 
-    $script:LogBox.SelectionStart = $script:LogBox.TextLength
-    try { $script:LogBox.ScrollToCaret() } catch {}
-    [System.Windows.Forms.Application]::DoEvents()
+    $aggPct = if ($totalAll -gt 0) { [math]::Min(100, [math]::Floor($upAll * 100.0 / $totalAll)) } else { 0 }
+    $uploadedGb = [math]::Round($upAll / 1GB, 2)
+    $totalGb = [math]::Round($totalAll / 1GB, 2)
+    $detail = "Файлы: $doneCnt/$($script:MultiProgressState.Count), объём: $uploadedGb/$totalGb ГБ"
+    if ($errorCnt -gt 0) { $detail += ", ошибок: $errorCnt" }
+
+    if ($script:StatusLabel_ref) {
+        $script:StatusLabel_ref.Text = "НЕ ЗАКРЫВАЙТЕ ОКНО. Загрузка ($doneCnt/$($script:MultiProgressState.Count)): $aggPct%"
+    }
+    Set-UploadProgressUi -Percent $aggPct -Title 'Идёт загрузка записей' -Detail $detail -Rows $rows.ToArray()
 }
 
 function Show-UploadProgress {
@@ -1238,12 +1215,33 @@ function Invoke-Download {
         try {
             $wc = New-Object System.Net.WebClient
             $wc.Headers.Add('User-Agent', 'goodwin_obs-portable-installer')
+            $lastProgressTick = 0
+            $lastProgressPct = -1
+            $wc.add_DownloadProgressChanged({
+                param($sender, $eventArgs)
+                try {
+                    $pct = [int]$eventArgs.ProgressPercentage
+                    $nowTick = [Environment]::TickCount
+                    if ($pct -eq $lastProgressPct -and (($nowTick - $lastProgressTick) -lt 300)) { return }
+                    $lastProgressTick = $nowTick
+                    $lastProgressPct = $pct
+
+                    $receivedMb = [math]::Round([double]$eventArgs.BytesReceived / 1MB, 1)
+                    if ($eventArgs.TotalBytesToReceive -gt 0) {
+                        $totalMb = [math]::Round([double]$eventArgs.TotalBytesToReceive / 1MB, 1)
+                        Set-Status ("Скачиваем OBS Studio: {0}% ({1} / {2} МБ)" -f $pct, $receivedMb, $totalMb) 'Yellow'
+                    } else {
+                        Set-Status ("Скачиваем OBS Studio: {0} МБ" -f $receivedMb) 'Yellow'
+                    }
+                }
+                catch {}
+            })
 
             $task = $wc.DownloadFileTaskAsync($Uri, $OutFile)
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $timeoutSec = 1200   # 20 минут на попытку — страховка от зависшего соединения без RST
             while (-not $task.IsCompleted) {
-                if ($script:LogBox) { [System.Windows.Forms.Application]::DoEvents() }
+                try { [System.Windows.Forms.Application]::DoEvents() } catch {}
                 Start-Sleep -Milliseconds 100
                 if ($sw.Elapsed.TotalSeconds -gt $timeoutSec) {
                     try { $wc.CancelAsync() } catch {}
@@ -1251,6 +1249,7 @@ function Invoke-Download {
                 }
             }
             if ($task.IsFaulted) { throw $task.Exception.InnerException }
+            Set-Status 'Установка OBS...' 'Yellow'
             return
         }
         catch {
@@ -1383,7 +1382,7 @@ function Install-ObsPortable {
     $obsZipUrl = Get-LatestObsZipUrl
     $obsZip = Join-Path $TempRoot 'obs.zip'
 
-    if ($script:LogBox) { Set-Status 'Скачиваем OBS Studio — это может занять несколько минут...' 'Yellow' }
+    if ($script:StatusLabel_ref) { Set-Status 'Скачиваем OBS Studio — это может занять несколько минут...' 'Yellow' }
     Write-Log 'Скачиваем OBS Studio...'
     Invoke-Download -Uri $obsZipUrl -OutFile $obsZip
 
@@ -1403,7 +1402,7 @@ function Install-ObsPortable {
             Write-Log "Подпись obs64.exe подтверждена: $($sig.SignerCertificate.Subject)"
         } else {
             Write-Log "⚠ Подпись obs64.exe НЕ подтверждена (Status=$($sig.Status)) — возможна подмена дистрибутива."
-            if ($script:LogBox) { Set-Status '⚠ Подпись OBS не подтверждена — будьте внимательны' 'Yellow' }
+            if ($script:StatusLabel_ref) { Set-Status '⚠ Подпись OBS не подтверждена — будьте внимательны' 'Yellow' }
         }
     }
     catch {
@@ -1946,13 +1945,7 @@ function Show-LowDiskSpaceWarning {
         $freeGb = [math]::Round(($drive.Free / 1GB), 1)
 
         if ($drive.Free -lt 30GB) {
-            $border = '═' * 56
-            Write-Step ''
-            Write-Step "╔$border╗"
-            Write-Step '║  ⚠ МАЛО МЕСТА НА ДИСКЕ!                              ║'
-            Write-Step "║  Свободно: $freeGb ГБ — запись может быть < 2 часов   ║"
-            Write-Step "╚$border╝"
-            Write-Step ''
+            Write-Step "Мало места на диске: свободно $freeGb ГБ, запись может быть короче 2 часов."
 
             if ($script:StatusLabel_ref) {
                 Set-Status "⚠ Мало места на диске: $freeGb ГБ свободно" 'Red'
@@ -2327,6 +2320,129 @@ function Invoke-UploadWithRetry {
 $script:CachedAccessToken = $null
 $script:CachedAccessTokenExpiresAt = [datetime]::MinValue
 $script:DropboxUploadFolderPath = $DropboxUploadFolderPath
+$script:DropboxAccessState = 'Не проверен'
+
+function Get-GoodwinSecretKey {
+    $key = [Environment]::GetEnvironmentVariable('GOODWIN_OBS_KEY', 'Process')
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        throw 'Не задан ключ дешифровки GOODWIN_OBS_KEY. Укажите его в переменной окружения перед запуском скрипта.'
+    }
+    return $key
+}
+
+function Unprotect-GoodwinSecret {
+    param(
+        [Parameter(Mandatory = $true)][string] $Payload,
+        [Parameter(Mandatory = $true)][string] $Password
+    )
+
+    $parts = $Payload -split ':', 4
+    if ($parts.Count -ne 4 -or $parts[0] -ne 'v1') {
+        throw 'Некорректный формат зашифрованного значения.'
+    }
+
+    $salt = [Convert]::FromBase64String($parts[1])
+    $iv = [Convert]::FromBase64String($parts[2])
+    $cipher = [Convert]::FromBase64String($parts[3])
+    $kdf = $null
+    $aes = $null
+    $dec = $null
+    try {
+        $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($Password, $salt, 100000)
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256
+        $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = $kdf.GetBytes(32)
+        $aes.IV = $iv
+        $dec = $aes.CreateDecryptor()
+        $plain = $dec.TransformFinalBlock($cipher, 0, $cipher.Length)
+        return [Text.Encoding]::UTF8.GetString($plain)
+    }
+    catch {
+        throw 'Не удалось расшифровать Dropbox OAuth-конфиг. Проверьте ключ GOODWIN_OBS_KEY.'
+    }
+    finally {
+        if ($dec) { $dec.Dispose() }
+        if ($aes) { $aes.Dispose() }
+        if ($kdf) { $kdf.Dispose() }
+    }
+}
+
+function Get-DropboxOAuthConfig {
+    if ($script:DropboxOAuthConfig) { return $script:DropboxOAuthConfig }
+
+    $key = Get-GoodwinSecretKey
+    $script:DropboxOAuthConfig = [pscustomobject]@{
+        AppKey    = Unprotect-GoodwinSecret $script:DropboxOAuthEncrypted.k $key
+        AppSecret = Unprotect-GoodwinSecret $script:DropboxOAuthEncrypted.s $key
+        AuthCode  = Unprotect-GoodwinSecret $script:DropboxOAuthEncrypted.c $key
+    }
+    return $script:DropboxOAuthConfig
+}
+
+function Get-DropboxAuthCodeFromInput {
+    param([Parameter(Mandatory = $true)][string] $InputText)
+
+    $value = $InputText.Trim()
+    if ($value -match '^https?://') {
+        $uri = [Uri]$value
+        $query = $uri.Query.TrimStart('?')
+        foreach ($part in ($query -split '&')) {
+            $kv = $part -split '=', 2
+            if ($kv.Count -eq 2 -and $kv[0] -eq 'auth_code') {
+                return [Uri]::UnescapeDataString($kv[1])
+            }
+        }
+        throw 'В Dropbox authorize URL не найден параметр auth_code.'
+    }
+
+    return $value
+}
+
+function Ensure-DropboxRefreshToken {
+    if (-not [string]::IsNullOrWhiteSpace($script:DropboxRuntimeRefreshToken)) {
+        return $script:DropboxRuntimeRefreshToken
+    }
+
+    $cfg = Get-DropboxOAuthConfig
+    if ([string]::IsNullOrWhiteSpace($cfg.AuthCode)) {
+        throw 'Dropbox auth_code не задан в зашифрованном OAuth-конфиге.'
+    }
+
+    Write-Log 'Обмениваем Dropbox auth_code на refresh_token...'
+    $code = Get-DropboxAuthCodeFromInput -InputText $cfg.AuthCode
+    $pair = '{0}:{1}' -f $cfg.AppKey, $cfg.AppSecret
+    $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+
+    try {
+        $response = Invoke-UploadWithRetry -Retries 2 -Operation {
+            Invoke-RestMethod `
+                -Method Post `
+                -Uri 'https://api.dropboxapi.com/oauth2/token' `
+                -Headers @{ Authorization = "Basic $basic" } `
+                -Body @{
+                    code = $code
+                    grant_type = 'authorization_code'
+                } `
+                -TimeoutSec 30
+        }
+    }
+    catch {
+        $detail = Get-WebExceptionDetail $_
+        $statusText = if ($detail.StatusCode) { "HTTP $($detail.StatusCode)" } else { 'сетевая ошибка' }
+        Write-Log "Обмен Dropbox auth_code не удался ($statusText): $($_.Exception.Message)"
+        if ($detail.Body) { Write-Log "Тело ответа Dropbox OAuth: $($detail.Body)" }
+        throw "Не удалось обменять Dropbox auth_code на refresh_token ($statusText). Получите новый auth_code: он одноразовый и быстро истекает."
+    }
+
+    if (-not $response.refresh_token) {
+        throw 'Dropbox OAuth не вернул refresh_token. Проверьте, что auth_code получен с token_access_type=offline.'
+    }
+
+    $script:DropboxRuntimeRefreshToken = [string]$response.refresh_token
+    return $script:DropboxRuntimeRefreshToken
+}
 
 function Get-DropboxAccessToken {
     [CmdletBinding()]
@@ -2337,14 +2453,21 @@ function Get-DropboxAccessToken {
     # Переиспользуем токен, пока до истечения > 5 минут; иначе спрашиваем сервер заново.
     if (-not $Force -and $script:CachedAccessToken -and
         ((Get-Date) -lt $script:CachedAccessTokenExpiresAt.AddMinutes(-5))) {
+        Set-DropboxAccessState 'Готов'
         return $script:CachedAccessToken
     }
 
-    if ([string]::IsNullOrWhiteSpace($DropboxRefreshToken)) {
-        throw 'Dropbox refresh token не задан. Получите свежий authorization code с token_access_type=offline, обменяйте его на refresh_token и вставьте в $DropboxRefreshToken.'
+    Set-DropboxAccessState 'Проверка'
+    try {
+        $refreshToken = Ensure-DropboxRefreshToken
+    }
+    catch {
+        Set-DropboxAccessState 'Ошибка'
+        throw
     }
 
-    $pair = "$DropboxAppKey`:$DropboxAppSecret"
+    $cfg = Get-DropboxOAuthConfig
+    $pair = '{0}:{1}' -f $cfg.AppKey, $cfg.AppSecret
     $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
     try {
         $response = Invoke-UploadWithRetry {
@@ -2354,7 +2477,7 @@ function Get-DropboxAccessToken {
                 -Headers @{ Authorization = "Basic $basic" } `
                 -Body @{
                     grant_type = 'refresh_token'
-                    refresh_token = $DropboxRefreshToken
+                    refresh_token = $refreshToken
                 } `
                 -TimeoutSec 30
         }
@@ -2364,16 +2487,19 @@ function Get-DropboxAccessToken {
         $statusText = if ($detail.StatusCode) { "HTTP $($detail.StatusCode)" } else { 'сетевая ошибка' }
         Write-Log "Запрос Dropbox access token не удался ($statusText): $($_.Exception.Message)"
         if ($detail.Body) { Write-Log "Тело ответа Dropbox OAuth: $($detail.Body)" }
-        throw "Не удалось получить Dropbox access token ($statusText). Проверьте переменную DropboxRefreshToken, App key/App secret и права приложения."
+        Set-DropboxAccessState 'Ошибка'
+        throw "Не удалось получить Dropbox access token ($statusText). Проверьте ключ GOODWIN_OBS_KEY, OAuth-конфиг и права приложения."
     }
 
     if (-not $response.access_token) {
+        Set-DropboxAccessState 'Ошибка'
         throw 'Dropbox OAuth не вернул access_token.'
     }
 
     $lifetime = if ($response.expires_in) { [int]$response.expires_in } else { 3600 }
     $script:CachedAccessToken = $response.access_token
     $script:CachedAccessTokenExpiresAt = (Get-Date).AddSeconds($lifetime)
+    Set-DropboxAccessState 'Готов'
     return $script:CachedAccessToken
 }
 
@@ -2422,21 +2548,34 @@ function Ensure-DropboxUploadFolder {
     }
 }
 
+function Set-DropboxAccessState {
+    param([string] $State)
+
+    $script:DropboxAccessState = $State
+    if ($script:DropboxStateLabel_ref) {
+        $script:DropboxStateLabel_ref.Text = $State
+        try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+    }
+}
+
 function Test-DropboxAccess {
     # Дополнительная проверка: убеждаемся, что OAuth-токен живой и папка
     # Dropbox для загрузки доступна на запись.
     # Возвращает $true при успехе, $false иначе. Сама ошибка пишется в технический лог.
+    Set-DropboxAccessState 'Проверка'
     try {
         Ensure-Tls12
         $accessToken = Get-DropboxAccessToken
         Ensure-DropboxUploadFolder -AccessToken $accessToken
         Write-Log "Dropbox API: папка '$($script:DropboxUploadFolderPath)' доступна для загрузки"
+        Set-DropboxAccessState 'Готов'
         return $true
     }
     catch {
         $detail = Get-WebExceptionDetail $_
         Write-Log "Dropbox API check FAILED: $($_.Exception.Message)"
         if ($detail.Body) { Write-Log "Detail: $($detail.Body)" }
+        Set-DropboxAccessState 'Ошибка'
         return $false
     }
 }
@@ -2733,7 +2872,7 @@ function Upload-RecordedFiles {
         $sessions.Add($s) | Out-Null
     }
 
-    # Инициализируем многострочный прогресс
+    # Инициализируем состояние прогресса
     Initialize-MultiProgress -Names ($sessions | ForEach-Object { $_.Name })
     foreach ($s in $sessions) {
         if ($s.Error) {
@@ -2910,7 +3049,7 @@ function Upload-RecordedFiles {
         try { $client.Dispose() } catch {}
     }
 
-    # Сворачиваем прогресс-блок, выводим финальные строки на каждый файл.
+    # Очищаем состояние прогресса, выводим финальные строки на каждый файл.
     Clear-UploadProgress
     $uploadErrors = 0
     $hist = Load-UploadHistory          # читаем историю один раз...
@@ -2950,50 +3089,7 @@ function Upload-RecordedFiles {
     }
     if ($histChanged) { Save-UploadHistory $hist }   # ...и сохраняем один раз
 
-    if ($script:LogBox) {
-        $script:LogBox.AppendText("`r`n")
-
-        $gold   = [System.Drawing.Color]::FromArgb(218, 165, 32)
-        $green  = [System.Drawing.Color]::FromArgb(80, 200, 80)
-        $dim    = [System.Drawing.Color]::FromArgb(140, 140, 140)
-        $boldFont   = New-Object System.Drawing.Font('Consolas', 11, [System.Drawing.FontStyle]::Bold)
-        $normalFont = New-Object System.Drawing.Font('Consolas', 9)
-
-        $thankLines = @(
-            @{ Text = '  ╔══════════════════════════════════════════════╗'; Color = $dim;   Font = $normalFont }
-            @{ Text = '  ║                                              ║'; Color = $dim;   Font = $normalFont }
-            @{ Text = '  ║     ⚔  СПАСИБО  ЗА  УЧАСТИЕ!  ⚔            ║'; Color = $gold;  Font = $boldFont }
-            @{ Text = '  ║                                              ║'; Color = $dim;   Font = $normalFont }
-            @{ Text = '  ║   Все записи загружены в Dropbox.            ║'; Color = $green; Font = $normalFont }
-            @{ Text = '  ║   Окно можно закрыть. GG WP!                ║'; Color = $green; Font = $normalFont }
-            @{ Text = '  ║                                              ║'; Color = $dim;   Font = $normalFont }
-            @{ Text = '  ╚══════════════════════════════════════════════╝'; Color = $dim;   Font = $normalFont }
-        )
-
-        foreach ($line in $thankLines) {
-            $script:LogBox.SelectionStart = $script:LogBox.TextLength
-            $script:LogBox.SelectionColor = $line.Color
-            $script:LogBox.SelectionFont  = $line.Font
-            $script:LogBox.AppendText($line.Text + "`r`n")
-        }
-
-        # Сброс стиля
-        $script:LogBox.SelectionStart = $script:LogBox.TextLength
-        $script:LogBox.SelectionFont  = $normalFont
-        $script:LogBox.SelectionColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
-        if ($script:LogBox.IsHandleCreated) {
-            $script:LogBox.SelectionStart = $script:LogBox.TextLength
-            $script:LogBox.SelectionLength = 0
-            try { $script:LogBox.ScrollToCaret() } catch {}
-        }
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-    else {
-        $border = '═' * 52
-        Write-Host "╔$border╗" -ForegroundColor DarkYellow
-        Write-Host "║  ⚔  СПАСИБО  ЗА  УЧАСТИЕ!  GG WP!  ⚔          ║" -ForegroundColor Yellow
-        Write-Host "╚$border╝" -ForegroundColor DarkYellow
-    }
+    Write-Step 'Все записи загружены в Dropbox. Окно можно закрыть.'
 
     if ($uploadErrors -gt 0) {
         $details = @(
@@ -3870,8 +3966,8 @@ $script:AppIcon = Get-AppIcon
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Goodwin OBS'
 if ($script:AppIcon) { $form.Icon = $script:AppIcon }
-$form.ClientSize = New-Object System.Drawing.Size(1020, 800)
-$form.MinimumSize = New-Object System.Drawing.Size(1040, 840)
+$form.ClientSize = New-Object System.Drawing.Size(1020, 388)
+$form.MinimumSize = New-Object System.Drawing.Size(1040, 428)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -3891,10 +3987,14 @@ $colorBlue     = [System.Drawing.Color]::FromArgb(59, 130, 246)
 $colorAmber    = [System.Drawing.Color]::FromArgb(245, 158, 11)
 $colorDanger   = [System.Drawing.Color]::FromArgb(239, 68, 68)
 $script:UiImages = New-Object System.Collections.Generic.List[object]
+$script:ToolTip = New-Object System.Windows.Forms.ToolTip
+$script:ToolTip.AutoPopDelay = 8000
+$script:ToolTip.InitialDelay = 350
+$script:ToolTip.ReshowDelay = 100
 
 function New-IconBitmap {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('brand','install','play','upload','folder','refresh','trash','edit','mic','camera')][string] $Kind,
+        [Parameter(Mandatory = $true)][ValidateSet('brand','install','play','upload','folder','refresh','trash','edit','gear','mic','camera','logs')][string] $Kind,
         [System.Drawing.Color] $Color = [System.Drawing.Color]::White,
         [int] $Size = 22
     )
@@ -3956,24 +4056,34 @@ function New-IconBitmap {
                 $g.FillPolygon($brush, [System.Drawing.PointF[]]$pts)
             }
             'upload' {
-                $g.DrawArc($pen, $s*0.16, $s*0.34, $s*0.30, $s*0.28, 190, 190)
-                $g.DrawArc($pen, $s*0.34, $s*0.22, $s*0.36, $s*0.36, 190, 180)
-                $g.DrawArc($pen, $s*0.58, $s*0.38, $s*0.28, $s*0.24, 250, 180)
-                $g.DrawLine($pen, $s*0.26, $s*0.65, $s*0.76, $s*0.65)
-                $g.DrawLine($pen, $s*0.50, $s*0.76, $s*0.50, $s*0.40)
-                $g.DrawLine($pen, $s*0.34, $s*0.54, $s*0.50, $s*0.38)
-                $g.DrawLine($pen, $s*0.66, $s*0.54, $s*0.50, $s*0.38)
+                $g.DrawLine($pen, $s*0.50, $s*0.18, $s*0.50, $s*0.62)
+                $g.DrawLine($pen, $s*0.32, $s*0.36, $s*0.50, $s*0.18)
+                $g.DrawLine($pen, $s*0.68, $s*0.36, $s*0.50, $s*0.18)
+                $g.DrawLine($pen, $s*0.22, $s*0.70, $s*0.78, $s*0.70)
+                $g.DrawLine($pen, $s*0.22, $s*0.70, $s*0.22, $s*0.82)
+                $g.DrawLine($pen, $s*0.78, $s*0.70, $s*0.78, $s*0.82)
+                $g.DrawLine($pen, $s*0.22, $s*0.82, $s*0.78, $s*0.82)
             }
             'folder' {
-                $g.DrawLine($pen, $s*0.14, $s*0.34, $s*0.36, $s*0.34)
-                $g.DrawLine($pen, $s*0.36, $s*0.34, $s*0.45, $s*0.44)
-                $g.DrawLine($pen, $s*0.45, $s*0.44, $s*0.86, $s*0.44)
-                $g.DrawRectangle($pen, $s*0.14, $s*0.34, $s*0.72, $s*0.44)
+                $pts = @(
+                    (& $pt 0.14 0.30),
+                    (& $pt 0.36 0.30),
+                    (& $pt 0.44 0.40),
+                    (& $pt 0.86 0.40),
+                    (& $pt 0.86 0.78),
+                    (& $pt 0.14 0.78)
+                )
+                $g.DrawPolygon($pen, [System.Drawing.PointF[]]$pts)
+                $g.DrawLine($pen, $s*0.14, $s*0.48, $s*0.86, $s*0.48)
             }
             'refresh' {
-                $g.DrawArc($pen, $s*0.20, $s*0.20, $s*0.60, $s*0.60, 35, 275)
-                $g.DrawLine($pen, $s*0.78, $s*0.28, $s*0.78, $s*0.52)
-                $g.DrawLine($pen, $s*0.78, $s*0.28, $s*0.58, $s*0.30)
+                $g.DrawArc($pen, $s*0.18, $s*0.18, $s*0.64, $s*0.64, 42, 282)
+                $head = @(
+                    (& $pt 0.82 0.22),
+                    (& $pt 0.82 0.48),
+                    (& $pt 0.62 0.34)
+                )
+                $g.FillPolygon($brush, [System.Drawing.PointF[]]$head)
             }
             'trash' {
                 $g.DrawLine($pen, $s*0.32, $s*0.26, $s*0.68, $s*0.26)
@@ -3986,6 +4096,20 @@ function New-IconBitmap {
                 $g.DrawLine($pen, $s*0.24, $s*0.72, $s*0.66, $s*0.30)
                 $g.DrawLine($pen, $s*0.58, $s*0.22, $s*0.76, $s*0.40)
                 $g.DrawLine($pen, $s*0.20, $s*0.80, $s*0.38, $s*0.76)
+            }
+            'gear' {
+                $cx = [single]($s * 0.50)
+                $cy = [single]($s * 0.50)
+                for ($a = 0; $a -lt 360; $a += 45) {
+                    $rad = [Math]::PI * $a / 180.0
+                    $x1 = [single]($cx + [Math]::Cos($rad) * $s * 0.31)
+                    $y1 = [single]($cy + [Math]::Sin($rad) * $s * 0.31)
+                    $x2 = [single]($cx + [Math]::Cos($rad) * $s * 0.43)
+                    $y2 = [single]($cy + [Math]::Sin($rad) * $s * 0.43)
+                    $g.DrawLine($pen, $x1, $y1, $x2, $y2)
+                }
+                $g.DrawEllipse($pen, $s*0.25, $s*0.25, $s*0.50, $s*0.50)
+                $g.DrawEllipse($pen, $s*0.42, $s*0.42, $s*0.16, $s*0.16)
             }
             'mic' {
                 $g.DrawArc($pen, $s*0.38, $s*0.14, $s*0.24, $s*0.18, 180, 180)
@@ -4005,6 +4129,12 @@ function New-IconBitmap {
                     (& $pt 0.70 0.58)
                 )
                 $g.DrawPolygon($pen, [System.Drawing.PointF[]]$pts)
+            }
+            'logs' {
+                $g.DrawRectangle($pen, $s*0.24, $s*0.16, $s*0.52, $s*0.68)
+                $g.DrawLine($pen, $s*0.36, $s*0.34, $s*0.64, $s*0.34)
+                $g.DrawLine($pen, $s*0.36, $s*0.50, $s*0.64, $s*0.50)
+                $g.DrawLine($pen, $s*0.36, $s*0.66, $s*0.56, $s*0.66)
             }
         }
     }
@@ -4058,16 +4188,35 @@ function New-UiTextBox {
         [string] $Text = '',
         [bool] $ReadOnly = $false
     )
-    $txt = New-Object System.Windows.Forms.TextBox
-    $txt.Location = New-Object System.Drawing.Point($X, $Y)
-    $txt.Size = New-Object System.Drawing.Size($W, 28)
-    $txt.BackColor = $colorInput
-    $txt.ForeColor = if ($ReadOnly) { [System.Drawing.Color]::FromArgb(205, 213, 224) } else { $colorText }
-    $txt.BorderStyle = 'FixedSingle'
-    $txt.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
-    $txt.ReadOnly = $ReadOnly
-    $txt.Text = $Text
-    $Parent.Controls.Add($txt)
+    $frame = New-Object System.Windows.Forms.Panel
+    $frame.Location = New-Object System.Drawing.Point($X, $Y)
+    $frame.Size = New-Object System.Drawing.Size($W, 30)
+    $frame.BackColor = [System.Drawing.Color]::Transparent
+
+    if ($ReadOnly) {
+        $txt = New-Object System.Windows.Forms.Label
+        $txt.Location = New-Object System.Drawing.Point(12, 5)
+        $txt.Size = New-Object System.Drawing.Size(([math]::Max(20, $W - 24)), 20)
+        $txt.TextAlign = 'MiddleLeft'
+        $txt.AutoEllipsis = $true
+        $txt.BackColor = [System.Drawing.Color]::Transparent
+        $txt.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 238)
+        $txt.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+        $txt.Text = $Text
+    } else {
+        $txt = New-Object System.Windows.Forms.TextBox
+        $txt.Location = New-Object System.Drawing.Point(12, 6)
+        $txt.Size = New-Object System.Drawing.Size(([math]::Max(20, $W - 24)), 22)
+        $txt.BackColor = [System.Drawing.Color]::FromArgb(24, 31, 42)
+        $txt.ForeColor = $colorText
+        $txt.BorderStyle = 'None'
+        $txt.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+        $txt.ReadOnly = $false
+        $txt.Text = $Text
+    }
+    $frame.Controls.Add($txt)
+    $Parent.Controls.Add($frame)
+    Set-UiTextFieldStyle -Frame $frame -TextBox $txt -ReadOnly $ReadOnly
     return $txt
 }
 
@@ -4095,6 +4244,112 @@ function New-RoundedRectPath {
     $path.AddArc($arc, 90, 90)
     $path.CloseFigure()
     return $path
+}
+
+function Paint-GoodwinTextField {
+    param([System.Windows.Forms.Panel] $Frame, [System.Windows.Forms.PaintEventArgs] $EventArgs)
+    $style = $Frame.Tag
+    if (-not $style -or $style.FieldStyle -ne 'GoodwinTextField') { return }
+
+    $g = $EventArgs.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+
+    $parentColor = if ($Frame.Parent) { $Frame.Parent.BackColor } else { $colorPanel }
+    $g.Clear($parentColor)
+
+    $rect = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, ([int]($Frame.Width - 1)), ([int]($Frame.Height - 1))
+    $bg = $style.BackColor
+    $border = $style.BorderColor
+    if (-not $Frame.Enabled) {
+        $bg = $style.DisabledBackColor
+        $border = $style.DisabledBorderColor
+    } elseif ($style.State -eq 'Focus') {
+        $border = $style.FocusBorderColor
+    } elseif ($style.State -eq 'Hover') {
+        $bg = $style.HoverBackColor
+        $border = $style.HoverBorderColor
+    }
+
+    $path = New-RoundedRectPath $rect $style.Radius
+    $brush = New-Object System.Drawing.SolidBrush($bg)
+    $pen = New-Object System.Drawing.Pen($border, 1)
+    try {
+        $g.FillPath($brush, $path)
+        $g.DrawPath($pen, $path)
+    }
+    finally {
+        $pen.Dispose()
+        $brush.Dispose()
+        $path.Dispose()
+    }
+}
+
+function Set-UiTextFieldStyle {
+    param(
+        [System.Windows.Forms.Panel] $Frame,
+        [System.Windows.Forms.Control] $TextBox,
+        [bool] $ReadOnly
+    )
+    $baseBack = [System.Drawing.Color]::FromArgb(24, 31, 42)
+    $Frame.Tag = [pscustomobject]@{
+        FieldStyle          = 'GoodwinTextField'
+        State               = 'Normal'
+        Radius              = 8
+        BackColor           = $baseBack
+        HoverBackColor      = [System.Drawing.Color]::FromArgb(28, 36, 49)
+        DisabledBackColor   = [System.Drawing.Color]::FromArgb(23, 27, 35)
+        BorderColor         = [System.Drawing.Color]::FromArgb(58, 70, 88)
+        HoverBorderColor    = [System.Drawing.Color]::FromArgb(80, 96, 120)
+        FocusBorderColor    = [System.Drawing.Color]::FromArgb(56, 189, 248)
+        DisabledBorderColor = [System.Drawing.Color]::FromArgb(43, 50, 62)
+    }
+    $TextBox.BackColor = if ($TextBox -is [System.Windows.Forms.Label]) { [System.Drawing.Color]::Transparent } else { $baseBack }
+    $TextBox.ForeColor = if ($ReadOnly) { [System.Drawing.Color]::FromArgb(218, 226, 238) } else { $colorText }
+    if ($TextBox -is [System.Windows.Forms.TextBox]) { $TextBox.ReadOnly = $ReadOnly }
+
+    $enter = {
+        if ($this -is [System.Windows.Forms.TextBox] -or $this -is [System.Windows.Forms.Label]) { $target = $this.Parent } else { $target = $this }
+        if ($target.Tag -and $target.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $target.Tag.State = 'Hover'
+            $target.Invalidate()
+        }
+    }
+    $leave = {
+        if ($this -is [System.Windows.Forms.TextBox] -or $this -is [System.Windows.Forms.Label]) { $target = $this.Parent } else { $target = $this }
+        if ($target.Tag -and $target.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $target.Tag.State = 'Normal'
+            $target.Invalidate()
+        }
+    }
+    $focus = {
+        if ($this.Parent.Tag -and $this.Parent.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $this.Parent.Tag.State = 'Focus'
+            $this.Parent.Invalidate()
+        }
+    }
+    $blur = {
+        if ($this.Parent.Tag -and $this.Parent.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $this.Parent.Tag.State = 'Normal'
+            $this.Parent.Invalidate()
+        }
+    }
+
+    $Frame.Add_Paint({ param($sender, $e) Paint-GoodwinTextField $sender $e })
+    $Frame.Add_MouseEnter($enter)
+    $Frame.Add_MouseLeave($leave)
+    $TextBox.Add_MouseEnter($enter)
+    $TextBox.Add_MouseLeave($leave)
+    if ($TextBox -is [System.Windows.Forms.TextBox]) {
+        $TextBox.Add_Enter($focus)
+        $TextBox.Add_Leave($blur)
+    }
+    $Frame.Add_EnabledChanged({
+        if ($this.Tag -and $this.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $this.Tag.State = 'Normal'
+            $this.Invalidate()
+        }
+    })
 }
 
 function Paint-GoodwinButton {
@@ -4136,12 +4391,47 @@ function Paint-GoodwinButton {
         }
         $g.DrawPath($borderPen, $path)
 
+        if ($Button.Enabled -and $style.BlinkActive) {
+            $pulse = if ($null -ne $script:BlinkPulse) { [double]$script:BlinkPulse } else { 0.0 }
+            $blinkBase = $style.BlinkBorderColor
+            $glowAlpha = [int](55 + (120 * $pulse))
+            $lineAlpha = [int](150 + (105 * $pulse))
+            $glowColor = [System.Drawing.Color]::FromArgb($glowAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
+            $blinkColor = [System.Drawing.Color]::FromArgb($lineAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
+            $glowRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
+            $glowPath = New-RoundedRectPath $glowRect ([math]::Max(2, $style.Radius - 1))
+            $glowPen = New-Object System.Drawing.Pen($glowColor, ([single](5.0 + (2.0 * $pulse))))
+            try { $g.DrawPath($glowPen, $glowPath) }
+            finally {
+                $glowPen.Dispose()
+                $glowPath.Dispose()
+            }
+
+            $blinkRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
+            $blinkPath = New-RoundedRectPath $blinkRect ([math]::Max(2, $style.Radius - 1))
+            $blinkPen = New-Object System.Drawing.Pen($blinkColor, ([single](2.8 + (1.4 * $pulse))))
+            try { $g.DrawPath($blinkPen, $blinkPath) }
+            finally {
+                $blinkPen.Dispose()
+                $blinkPath.Dispose()
+            }
+        }
+
         $textColor = if ($Button.Enabled) { $style.ForeColor } else { $style.DisabledForeColor }
-        $textSize = [System.Windows.Forms.TextRenderer]::MeasureText($Button.Text, $Button.Font)
-        $gap = if ($Button.Image) { 9 } else { 0 }
+        $hasText = -not [string]::IsNullOrWhiteSpace($Button.Text)
+        $textSize = if ($hasText) {
+            [System.Windows.Forms.TextRenderer]::MeasureText($Button.Text, $Button.Font)
+        } else {
+            New-Object System.Drawing.Size -ArgumentList 0, 0
+        }
+        $gap = if ($Button.Image -and $hasText) { 9 } else { 0 }
         $iconW = if ($Button.Image) { $Button.Image.Width } else { 0 }
         $totalW = $iconW + $gap + $textSize.Width
-        $startX = [math]::Max(12, [int](($Button.Width - $totalW) / 2))
+        $startX = if ($hasText) {
+            [math]::Max(12, [int](($Button.Width - $totalW) / 2))
+        } else {
+            [int](($Button.Width - $totalW) / 2)
+        }
 
         if ($Button.Image) {
             $iconY = [int](($Button.Height - $Button.Image.Height) / 2)
@@ -4150,12 +4440,14 @@ function Paint-GoodwinButton {
             $startX += $Button.Image.Width + $gap
         }
 
-        $textRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, 0, ([int]([math]::Max(20, $Button.Width - $startX - 12))), $Button.Height
-        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
-                 [System.Windows.Forms.TextFormatFlags]::Left -bor
-                 [System.Windows.Forms.TextFormatFlags]::SingleLine -bor
-                 [System.Windows.Forms.TextFormatFlags]::EndEllipsis
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $Button.Text, $Button.Font, $textRect, $textColor, $flags)
+        if ($hasText) {
+            $textRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, 0, ([int]([math]::Max(20, $Button.Width - $startX - 12))), $Button.Height
+            $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
+                     [System.Windows.Forms.TextFormatFlags]::Left -bor
+                     [System.Windows.Forms.TextFormatFlags]::SingleLine -bor
+                     [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $Button.Text, $Button.Font, $textRect, $textColor, $flags)
+        }
     }
     finally {
         $borderPen.Dispose()
@@ -4197,6 +4489,8 @@ function Set-UiButtonStyle {
         Radius              = $Radius
         HighlightAlpha      = $HighlightAlpha
         State               = 'Normal'
+        BlinkActive         = $false
+        BlinkBorderColor    = (Get-ShiftedColor $HoverColor 74)
     }
     $Button.Add_MouseEnter({
         if ($this.Enabled -and $this.Tag -and $this.Tag.ButtonStyle -eq 'Goodwin') {
@@ -4276,6 +4570,72 @@ function New-UtilityButton {
     return $btn
 }
 
+function New-InnerPanel {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [int] $H,
+        [System.Drawing.Color] $Color
+    )
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Location = New-Object System.Drawing.Point($X, $Y)
+    $panel.Size = New-Object System.Drawing.Size($W, $H)
+    $panel.BackColor = $Color
+    $Parent.Controls.Add($panel)
+    return $panel
+}
+
+function New-InfoCard {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [string] $Title,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [int] $H,
+        [System.Drawing.Color] $Accent
+    )
+    $card = New-InnerPanel $Parent $X $Y $W $H ([System.Drawing.Color]::FromArgb(24, 30, 40))
+    $stripe = New-Object System.Windows.Forms.Panel
+    $stripe.Location = New-Object System.Drawing.Point(0, 0)
+    $stripe.Size = New-Object System.Drawing.Size(4, $H)
+    $stripe.BackColor = $Accent
+    $card.Controls.Add($stripe)
+    [void](New-UiLabel $card $Title 16 12 ($W - 32) 18 $true $colorMuted)
+    return $card
+}
+
+function New-CompactInfoCard {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [string] $Title,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [System.Drawing.Color] $Accent
+    )
+    $card = New-InnerPanel $Parent $X $Y $W 44 ([System.Drawing.Color]::FromArgb(24, 30, 40))
+    $stripe = New-Object System.Windows.Forms.Panel
+    $stripe.Location = New-Object System.Drawing.Point(0, 0)
+    $stripe.Size = New-Object System.Drawing.Size(3, 44)
+    $stripe.BackColor = $Accent
+    $card.Controls.Add($stripe)
+
+    $titleLabel = New-UiLabel $card $Title 12 5 ($W - 22) 14 $true $colorMuted
+    $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI', 7.5, [System.Drawing.FontStyle]::Bold)
+
+    $stateLabel = New-UiLabel $card '' 12 21 ($W - 22) 18 $true $colorText
+    $stateLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5, [System.Drawing.FontStyle]::Bold)
+    $stateLabel.AutoEllipsis = $true
+
+    return [pscustomobject]@{
+        Card       = $card
+        StateLabel = $stateLabel
+    }
+}
+
 # === Шапка ===
 $headerPanel = New-PanelBlock 0 0 1020 90 ([System.Drawing.Color]::FromArgb(17, 22, 31))
 $brandBadge = New-IconBadge $headerPanel 'brand' 24 18 ([System.Drawing.Color]::FromArgb(12, 74, 110)) ([System.Drawing.Color]::FromArgb(186, 230, 253)) 54 30
@@ -4285,44 +4645,41 @@ $lblTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 19, [System
 $lblSubtitle = New-UiLabel $headerPanel 'OBS SETUP' 94 54 180 18 $false $colorMuted
 $lblSubtitle.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
 
+# === Краткое состояние ===
+$quickStatusPanel = New-InnerPanel $headerPanel 390 16 606 58 $colorPanel2
+$nickMini = New-CompactInfoCard $quickStatusPanel 'НИК' 10 7 116 $colorAccent
+$script:NickStateLabel_ref = $nickMini.StateLabel
+
+$dropboxMini = New-CompactInfoCard $quickStatusPanel 'DROPBOX' 136 7 144 $colorBlue
+$script:DropboxStateLabel_ref = $dropboxMini.StateLabel
+
+$obsMini = New-CompactInfoCard $quickStatusPanel 'OBS' 290 7 112 $colorGreen
+$script:ObsStateLabel_ref = $obsMini.StateLabel
+
+$uploadMini = New-CompactInfoCard $quickStatusPanel 'ЗАГРУЗКА' 412 7 184 $colorAmber
+$script:UploadStateLabel_ref = $uploadMini.StateLabel
+
 # === Параметры ===
-$settingsPanel = New-PanelBlock 24 108 972 166 $colorPanel
-[void](New-UiLabel $settingsPanel 'ПРОФИЛЬ' 18 14 120 18 $true $colorMuted)
-[void](New-UiLabel $settingsPanel 'УСТРОЙСТВА' 18 91 120 18 $true $colorMuted)
+$settingsPanel = New-PanelBlock 24 108 972 92 $colorPanel
+[void](New-UiLabel $settingsPanel 'НАСТРОЙКИ' 18 14 120 18 $true $colorMuted)
 
-$lblNick = New-UiLabel $settingsPanel 'Никнейм' 18 36 170
-$txtNick = New-UiTextBox $settingsPanel 18 58 180 $(if ($script:SelectedNickname) { $script:SelectedNickname } else { '' })
+$lblPath = New-UiLabel $settingsPanel 'Путь записи' 18 36 150
+$txtPath = New-UiTextBox $settingsPanel 18 58 430 $script:RecordingRoot $true
+$script:ToolTip.SetToolTip($txtPath, 'Изменить папку записи')
+$script:ToolTip.SetToolTip($txtPath.Parent, 'Изменить папку записи')
 
-$lblPath = New-UiLabel $settingsPanel 'Путь записи' 216 36 170
-$btnPath = New-UtilityButton $settingsPanel 'Изменить' 216 57 96
-$txtPath = New-UiTextBox $settingsPanel 322 58 626 $script:RecordingRoot $true
+$lblMic = New-UiLabel $settingsPanel 'Микрофон' 466 36 150
+$txtMicSel = New-UiTextBox $settingsPanel 466 58 220 $(if ($script:SelectedMic) { $script:SelectedMic } else { 'Авто' }) $true
+$script:ToolTip.SetToolTip($txtMicSel, 'Выбрать микрофон')
+$script:ToolTip.SetToolTip($txtMicSel.Parent, 'Выбрать микрофон')
 
-$lblMic = New-UiLabel $settingsPanel 'Микрофон' 18 113 170
-$txtMicSel = New-UiTextBox $settingsPanel 18 134 300 $(if ($script:SelectedMic) { $script:SelectedMic } else { 'Автоопределение' }) $true
-$btnMicSel = New-UtilityButton $settingsPanel 'Выбрать' 328 133 88
-
-$lblCam = New-UiLabel $settingsPanel 'Камера' 438 113 170
-$txtCamSel = New-UiTextBox $settingsPanel 438 134 420 $(if ($script:SelectedCamera) { $script:SelectedCamera } else { 'Автоопределение' }) $true
-$btnCamSel = New-UtilityButton $settingsPanel 'Выбрать' 868 133 86
-
-# === Журнал ===
-$logPanel = New-PanelBlock 24 286 972 350 $colorPanel2
-[void](New-UiLabel $logPanel 'ЖУРНАЛ' 18 14 120 18 $true $colorMuted)
-$script:LogBox = New-Object System.Windows.Forms.RichTextBox
-$script:LogBox.Location = New-Object System.Drawing.Point(18, 42)
-$script:LogBox.Size     = New-Object System.Drawing.Size(936, 290)
-$script:LogBox.ReadOnly = $true
-$script:LogBox.BackColor = [System.Drawing.Color]::FromArgb(9, 12, 18)
-$script:LogBox.ForeColor = [System.Drawing.Color]::FromArgb(220, 226, 235)
-$script:LogBox.Font = New-Object System.Drawing.Font('Consolas', 9)
-$script:LogBox.ScrollBars = 'Vertical'
-$script:LogBox.HideSelection = $false
-$script:LogBox.TabStop = $false
-$script:LogBox.BorderStyle = 'FixedSingle'
-$logPanel.Controls.Add($script:LogBox)
+$lblCam = New-UiLabel $settingsPanel 'Камера' 704 36 150
+$txtCamSel = New-UiTextBox $settingsPanel 704 58 250 $(if ($script:SelectedCamera) { $script:SelectedCamera } else { 'Авто' }) $true
+$script:ToolTip.SetToolTip($txtCamSel, 'Выбрать камеру')
+$script:ToolTip.SetToolTip($txtCamSel.Parent, 'Выбрать камеру')
 
 # === Статус ===
-$statusPanel = New-PanelBlock 24 648 972 34 ([System.Drawing.Color]::FromArgb(18, 23, 31))
+$statusPanel = New-PanelBlock 24 212 972 34 ([System.Drawing.Color]::FromArgb(18, 23, 31))
 $statusAccent = New-Object System.Windows.Forms.Panel
 $statusAccent.Location = New-Object System.Drawing.Point(0, 0)
 $statusAccent.Size = New-Object System.Drawing.Size(4, 34)
@@ -4360,30 +4717,32 @@ function New-MainButton {
 }
 
 function New-SecondaryButton {
-    param([string] $Text, [int] $X, [int] $Y)
+    param([string] $Text, [int] $X, [int] $Y, [int] $W = 312)
     $btn = New-Object System.Windows.Forms.Button
     $btn.Location = New-Object System.Drawing.Point($X, $Y)
-    $btn.Size     = New-Object System.Drawing.Size(312, 38)
+    $btn.Size     = New-Object System.Drawing.Size($W, 38)
     $btn.Text = $Text
     Set-UiButtonStyle -Button $btn -Color ([System.Drawing.Color]::FromArgb(30, 37, 49)) -HoverColor ([System.Drawing.Color]::FromArgb(43, 52, 68)) -ForeColor ([System.Drawing.Color]::FromArgb(226, 232, 240)) -Radius 10 -BorderColor ([System.Drawing.Color]::FromArgb(62, 74, 92)) -HighlightAlpha 12
     $form.Controls.Add($btn)
     return $btn
 }
 
-$btnInstall = New-MainButton 'Установить OBS' 24  692  ([System.Drawing.Color]::FromArgb(20, 111, 60))  ([System.Drawing.Color]::FromArgb(27, 143, 76))
-$btnLaunch  = New-MainButton 'Запустить OBS'  354 692  ([System.Drawing.Color]::FromArgb(31, 82, 154))  ([System.Drawing.Color]::FromArgb(43, 105, 196)) $false
-$btnUpload  = New-MainButton 'Загрузить записи' 684 692 ([System.Drawing.Color]::FromArgb(145, 88, 22)) ([System.Drawing.Color]::FromArgb(181, 110, 25))
+$btnInstall = New-MainButton 'Установить OBS' 24  260  ([System.Drawing.Color]::FromArgb(20, 111, 60))  ([System.Drawing.Color]::FromArgb(27, 143, 76))
+$btnLaunch  = New-MainButton 'Запустить OBS'  354 260  ([System.Drawing.Color]::FromArgb(31, 82, 154))  ([System.Drawing.Color]::FromArgb(43, 105, 196)) $false
+$btnUpload  = New-MainButton 'Загрузить запись' 684 260 ([System.Drawing.Color]::FromArgb(145, 88, 22)) ([System.Drawing.Color]::FromArgb(181, 110, 25))
 Set-ButtonIcon -Button $btnInstall -Kind 'install'
 Set-ButtonIcon -Button $btnLaunch -Kind 'play'
 Set-ButtonIcon -Button $btnUpload -Kind 'upload'
 
 # === Вспомогательные кнопки ===
-$btnFolder = New-SecondaryButton 'Открыть папку записей' 24  752
-$btnFresh  = New-SecondaryButton 'Чистая установка'      354 752
-$btnClean  = New-SecondaryButton 'Очистить'              684 752
+$btnFolder = New-SecondaryButton 'Папка записей'    24  326 228
+$btnFresh  = New-SecondaryButton 'Чистая установка' 272 326 228
+$btnClean  = New-SecondaryButton 'Очистить'         520 326 228
+$btnLogs   = New-SecondaryButton 'Логи'             768 326 228
 Set-ButtonIcon -Button $btnFolder -Kind 'folder' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 Set-ButtonIcon -Button $btnFresh -Kind 'refresh' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 Set-ButtonIcon -Button $btnClean -Kind 'trash' -Color ([System.Drawing.Color]::FromArgb(248, 113, 113))
+Set-ButtonIcon -Button $btnLogs -Kind 'logs' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 
 function Set-Status {
     param([string] $Text, [string] $Color = 'Gray')
@@ -4398,6 +4757,45 @@ function Set-Status {
     $statusAccent.BackColor = $lblStatus.ForeColor
     $lblStatus.Text = $Text
     [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Update-OverviewState {
+    $nick = if ([string]::IsNullOrWhiteSpace($script:SelectedNickname) -or $script:SelectedNickname -eq 'untitled') {
+        'Не указан'
+    } else {
+        $script:SelectedNickname
+    }
+    if ($script:NickStateLabel_ref) { $script:NickStateLabel_ref.Text = Format-UiText $nick 18 }
+    if ($script:NickHintLabel_ref) {
+        $script:NickHintLabel_ref.Text = if ($nick -eq 'Не указан') {
+            'Будет запрошен перед запуском OBS'
+        } else {
+            'Будет использован в имени записи'
+        }
+    }
+
+    if ($script:DropboxStateLabel_ref) {
+        $script:DropboxStateLabel_ref.Text = if ($script:DropboxAccessState) { $script:DropboxAccessState } else { 'Не проверен' }
+    }
+
+    $obsExe = Join-Path $InstallDir 'bin\64bit\obs64.exe'
+    if ($script:ObsStateLabel_ref) {
+        $script:ObsStateLabel_ref.Text = if (Test-Path -LiteralPath $obsExe) { 'Готов' } else { 'Не установлен' }
+    }
+    if ($script:ObsHintLabel_ref) {
+        $script:ObsHintLabel_ref.Text = if (Test-Path -LiteralPath $obsExe) {
+            'Можно запускать запись'
+        } else {
+            'Нажмите «Установить OBS»'
+        }
+    }
+
+    if ($script:UploadStateLabel_ref -and -not $script:IsUploading) {
+        $script:UploadStateLabel_ref.Text = if ($script:HasNewRecording) { 'Новая запись' } else { 'Нет новых' }
+    }
+    if ($script:UploadHintLabel_ref -and -not $script:IsUploading) {
+        $script:UploadHintLabel_ref.Text = if ($script:HasNewRecording) { 'Можно загружать в Dropbox' } else { 'Новых записей нет' }
+    }
 }
 
 function Enable-Button  {
@@ -4428,15 +4826,141 @@ function Disable-Button {
     }
 }
 
+function Test-PortableObsReady {
+    return (Test-Path -LiteralPath (Join-Path $InstallDir 'bin\64bit\obs64.exe'))
+}
+
+function Set-ButtonBlink {
+    param($Button, [bool] $Active)
+    if (-not $Button -or -not $Button.Tag -or $Button.Tag.ButtonStyle -ne 'Goodwin') { return }
+    $changed = ($Button.Tag.BlinkActive -ne $Active)
+    $Button.Tag.BlinkActive = $Active
+    if ($changed -or $Active) { $Button.Invalidate() }
+}
+
+function Get-RecordingFileSnapshot {
+    $snapshot = @{}
+    try {
+        if ([string]::IsNullOrWhiteSpace($script:RecordingRoot) -or -not (Test-Path -LiteralPath $script:RecordingRoot)) {
+            return $snapshot
+        }
+        $patterns = @('*.mp4','*.mkv','*.mov','*.flv')
+        $files = @(Get-ChildItem -Path (Join-Path $script:RecordingRoot '*') -File -Include $patterns -ErrorAction SilentlyContinue)
+        foreach ($file in $files) {
+            if ($file.Length -le 0) { continue }
+            $snapshot[$file.FullName] = "{0}|{1}" -f $file.Length, $file.LastWriteTimeUtc.Ticks
+        }
+    }
+    catch {
+        Write-Log ('Не удалось прочитать папку записей: ' + $_.Exception.Message)
+    }
+    return $snapshot
+}
+
+function Reset-RecordingMonitor {
+    $script:RecordingFileSnapshot = Get-RecordingFileSnapshot
+    $script:HasNewRecording = $false
+    if ($script:UploadStateLabel_ref -and -not $script:IsUploading) { $script:UploadStateLabel_ref.Text = 'Нет новых' }
+    if ($script:UploadHintLabel_ref -and -not $script:IsUploading) { $script:UploadHintLabel_ref.Text = 'Новых записей нет' }
+}
+
+function Scan-RecordingFolderForNewFiles {
+    $current = Get-RecordingFileSnapshot
+    if ($null -eq $script:RecordingFileSnapshot) {
+        $script:RecordingFileSnapshot = $current
+        return
+    }
+
+    foreach ($path in $current.Keys) {
+        if (-not $script:RecordingFileSnapshot.ContainsKey($path)) {
+            if (-not $script:HasNewRecording) {
+                Write-Step ('Найдена новая запись: ' + [IO.Path]::GetFileName($path))
+            }
+            $script:HasNewRecording = $true
+            if ($script:UploadStateLabel_ref -and -not $script:IsUploading) { $script:UploadStateLabel_ref.Text = 'Новая запись' }
+            if ($script:UploadHintLabel_ref -and -not $script:IsUploading) { $script:UploadHintLabel_ref.Text = 'Можно загружать в Dropbox' }
+            return
+        }
+    }
+}
+
+function Update-BlinkTargets {
+    $obsReady = Test-PortableObsReady
+    if (-not $obsReady) { $script:ObsLaunchCompleted = $false }
+    $allowBlink = (-not $script:IsBusy)
+    Set-ButtonBlink $btnInstall ($allowBlink -and -not $obsReady)
+    Set-ButtonBlink $btnLaunch  ($allowBlink -and $obsReady -and -not $script:ObsLaunchCompleted)
+    Set-ButtonBlink $btnUpload  ($allowBlink -and $script:HasNewRecording -and -not $script:IsUploading)
+}
+
+if (Test-Path -LiteralPath (Join-Path $InstallDir 'bin\64bit\obs64.exe')) {
+    Enable-Button $btnLaunch
+}
+
 function Set-AuxControlsEnabled {
     # Включает/выключает второстепенные элементы (выбор устройств, путь записи,
-    # никнейм, «Открыть папку») на время длительной операции — чтобы их нельзя было
+    # «Открыть папку») на время длительной операции — чтобы их нельзя было
     # дёрнуть и устроить гонку с установкой/распаковкой.
     param([bool] $Enabled)
-    foreach ($c in @($btnCamSel, $btnMicSel, $btnPath, $btnFolder, $txtNick)) {
+    foreach ($c in @($txtCamSel, $txtCamSel.Parent, $txtMicSel, $txtMicSel.Parent, $txtPath, $txtPath.Parent, $btnFolder)) {
         if ($c) { $c.Enabled = $Enabled }
     }
 }
+
+Reset-RecordingMonitor
+Update-OverviewState
+
+$script:ObsLaunchCompleted = $false
+$script:BlinkPulse = 0.0
+$script:BlinkStartTicks = [Environment]::TickCount
+$script:LastRecordingScanUtc = [DateTime]::MinValue
+$script:StateTimer = New-Object System.Windows.Forms.Timer
+$script:StateTimer.Interval = 50
+$script:StateTimer.Add_Tick({
+    try {
+        $elapsedMs = [Environment]::TickCount - $script:BlinkStartTicks
+        $script:BlinkPulse = ([Math]::Sin((2.0 * [Math]::PI * $elapsedMs) / 1600.0) + 1.0) / 2.0
+        $now = [DateTime]::UtcNow
+        if (($now - $script:LastRecordingScanUtc).TotalSeconds -ge 2) {
+            $script:LastRecordingScanUtc = $now
+            Scan-RecordingFolderForNewFiles
+            Update-OverviewState
+        }
+        Update-BlinkTargets
+    }
+    catch {
+        Write-Log ('Ошибка таймера состояния: ' + $_.Exception.Message)
+    }
+})
+$script:StateTimer.Start()
+
+$script:StartupDropboxCheckStarted = $false
+$form.Add_Shown({
+    if ($script:StartupDropboxCheckStarted) { return }
+    $script:StartupDropboxCheckStarted = $true
+
+    $script:StartupDropboxCheckTimer = New-Object System.Windows.Forms.Timer
+    $script:StartupDropboxCheckTimer.Interval = 250
+    $script:StartupDropboxCheckTimer.Add_Tick({
+        param($sender, $eventArgs)
+        try {
+            $sender.Stop()
+            $sender.Dispose()
+            Write-Step 'Проверяем доступ к Dropbox'
+            if (Test-DropboxAccess) {
+                Write-Step 'Доступ к Dropbox подтверждён'
+            } else {
+                Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
+            }
+            Update-OverviewState
+        }
+        catch {
+            Set-DropboxAccessState 'Ошибка'
+            Write-ErrorDetails -Context 'Стартовая проверка Dropbox' -ErrorRecord $_
+        }
+    })
+    $script:StartupDropboxCheckTimer.Start()
+})
 
 # ── Диалог выбора камеры (отдельное окно с кнопкой предпросмотра) ──────────
 function Show-CameraSelectionDialog {
@@ -4459,11 +4983,11 @@ function Show-CameraSelectionDialog {
 
     $cmb = New-Object System.Windows.Forms.ComboBox
     $cmb.Location = New-Object System.Drawing.Point(85, 14)
-    $cmb.Size     = New-Object System.Drawing.Size(515, 25)
+    $cmb.Size     = New-Object System.Drawing.Size(500, 25)
     $cmb.DropDownStyle = 'DropDownList'
     $cmb.BackColor = $colorInput
     $cmb.ForeColor = $colorText
-    $cmb.Items.Add('Автоопределение') | Out-Null
+    $cmb.Items.Add('Авто') | Out-Null
     $camList = @(Get-CameraList)
     foreach ($c in $camList) { $cmb.Items.Add($c) | Out-Null }
     if ($camList.Count -eq 0) { Write-Step 'Камеры не обнаружены — проверьте подключение и доступ к камере в параметрах конфиденциальности Windows.' }
@@ -4475,8 +4999,8 @@ function Show-CameraSelectionDialog {
     $dlg.Controls.Add($cmb)
 
     $btnRefresh = New-Object System.Windows.Forms.Button
-    $btnRefresh.Location = New-Object System.Drawing.Point(605, 13)
-    $btnRefresh.Size     = New-Object System.Drawing.Size(85, 27)
+    $btnRefresh.Location = New-Object System.Drawing.Point(595, 13)
+    $btnRefresh.Size     = New-Object System.Drawing.Size(95, 27)
     $btnRefresh.Text = 'Обновить'
     Set-UiButtonStyle -Button $btnRefresh -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
     $dlg.Controls.Add($btnRefresh)
@@ -4530,7 +5054,7 @@ function Show-CameraSelectionDialog {
         & $stopPreview
         $current = if ($cmb.SelectedIndex -gt 0) { [string]$cmb.SelectedItem } else { $null }
         $cmb.Items.Clear()
-        $cmb.Items.Add('Автоопределение') | Out-Null
+        $cmb.Items.Add('Авто') | Out-Null
         foreach ($c in (Get-CameraList)) { $cmb.Items.Add($c) | Out-Null }
         if ($current -and $cmb.Items.Contains($current)) {
             $cmb.SelectedItem = $current
@@ -4541,16 +5065,16 @@ function Show-CameraSelectionDialog {
 
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text = 'OK'
-    $btnOk.Location = New-Object System.Drawing.Point(530, 478)
-    $btnOk.Size     = New-Object System.Drawing.Size(75, 32)
+    $btnOk.Location = New-Object System.Drawing.Point(504, 478)
+    $btnOk.Size     = New-Object System.Drawing.Size(80, 32)
     $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
     Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
     $dlg.Controls.Add($btnOk)
 
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = 'Отмена'
-    $btnCancel.Location = New-Object System.Drawing.Point(615, 478)
-    $btnCancel.Size     = New-Object System.Drawing.Size(75, 32)
+    $btnCancel.Text = 'Отменить'
+    $btnCancel.Location = New-Object System.Drawing.Point(594, 478)
+    $btnCancel.Size     = New-Object System.Drawing.Size(96, 32)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
     $dlg.Controls.Add($btnCancel)
@@ -4568,7 +5092,7 @@ function Show-CameraSelectionDialog {
     if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
         if ($cmb.SelectedIndex -le 0) {
             $script:SelectedCamera = $null
-            $txtCamSel.Text = 'Автоопределение'
+            $txtCamSel.Text = 'Авто'
         } else {
             $script:SelectedCamera = [string]$cmb.SelectedItem
             $txtCamSel.Text = $script:SelectedCamera
@@ -4604,7 +5128,7 @@ function Show-MicrophoneSelectionDialog {
     $cmb.DropDownStyle = 'DropDownList'
     $cmb.BackColor = $colorInput
     $cmb.ForeColor = $colorText
-    $cmb.Items.Add('Автоопределение') | Out-Null
+    $cmb.Items.Add('Авто') | Out-Null
     $micList = @(Get-MicrophoneList)
     foreach ($m in $micList) { $cmb.Items.Add($m) | Out-Null }
     if ($micList.Count -eq 0) { Write-Step 'Микрофоны не обнаружены — проверьте подключение и доступ к микрофону в параметрах конфиденциальности Windows.' }
@@ -4675,16 +5199,16 @@ function Show-MicrophoneSelectionDialog {
 
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text = 'OK'
-    $btnOk.Location = New-Object System.Drawing.Point(376, 195)
-    $btnOk.Size     = New-Object System.Drawing.Size(75, 30)
+    $btnOk.Location = New-Object System.Drawing.Point(336, 195)
+    $btnOk.Size     = New-Object System.Drawing.Size(86, 30)
     $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
     Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
     $dlg.Controls.Add($btnOk)
 
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = 'Отмена'
-    $btnCancel.Location = New-Object System.Drawing.Point(460, 195)
-    $btnCancel.Size     = New-Object System.Drawing.Size(75, 30)
+    $btnCancel.Text = 'Отменить'
+    $btnCancel.Location = New-Object System.Drawing.Point(432, 195)
+    $btnCancel.Size     = New-Object System.Drawing.Size(104, 30)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
     $dlg.Controls.Add($btnCancel)
@@ -4743,7 +5267,7 @@ function Show-MicrophoneSelectionDialog {
     if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
         if ($cmb.SelectedIndex -le 0) {
             $script:SelectedMic = $null
-            $txtMicSel.Text = 'Автоопределение'
+            $txtMicSel.Text = 'Авто'
         } else {
             $script:SelectedMic = [string]$cmb.SelectedItem
             $txtMicSel.Text = $script:SelectedMic
@@ -4754,17 +5278,32 @@ function Show-MicrophoneSelectionDialog {
     $dlg.Dispose()
 }
 
+function Set-SettingsFieldClick {
+    param(
+        [System.Windows.Forms.Control] $Field,
+        [scriptblock] $Action
+    )
+    foreach ($target in @($Field, $Field.Parent)) {
+        if (-not $target) { continue }
+        $target.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $target.Add_Click($Action)
+    }
+}
+
 # ── Обработчики выбора устройств / пути / никнейма ─────────────────────────
-$btnCamSel.Add_Click({
+$openCameraSettings = {
     if ($script:IsBusy) { return }
     try { Show-CameraSelectionDialog }
     catch { Write-ErrorDetails -Context 'Выбор камеры' -ErrorRecord $_ }
-})
-$btnMicSel.Add_Click({
+}
+Set-SettingsFieldClick $txtCamSel $openCameraSettings
+
+$openMicrophoneSettings = {
     if ($script:IsBusy) { return }
     try { Show-MicrophoneSelectionDialog }
     catch { Write-ErrorDetails -Context 'Выбор микрофона' -ErrorRecord $_ }
-})
+}
+Set-SettingsFieldClick $txtMicSel $openMicrophoneSettings
 
 function Sanitize-Nickname {
     param([string] $Value)
@@ -4775,25 +5314,201 @@ function Sanitize-Nickname {
     return $cleaned
 }
 
-$txtNick.Add_Leave({
-    if ($script:IsBusy) { return }
-    try {
-        $original = $txtNick.Text
-        $cleaned = Sanitize-Nickname $original
-        if ($cleaned -ne $original.Trim()) {
-            $txtNick.Text = $cleaned
-            Write-Step "Никнейм скорректирован: $cleaned"
-        } elseif ($txtNick.Text -ne $cleaned) {
-            $txtNick.Text = $cleaned
-        }
-        $script:SelectedNickname = $cleaned
-        Save-CurrentSettings
-        Write-Step "Никнейм установлен: $script:SelectedNickname"
-    }
-    catch { Write-ErrorDetails -Context 'Никнейм' -ErrorRecord $_ }
-})
+function Set-SelectedNickname {
+    param([string] $Nickname)
+    $cleaned = Sanitize-Nickname $Nickname
+    $script:SelectedNickname = $cleaned
+    Save-CurrentSettings
+    Update-OverviewState
+    Write-Step "Ник записи: $script:SelectedNickname"
+    return $cleaned
+}
 
-$btnPath.Add_Click({
+function Show-NicknameDialog {
+    param(
+        [string] $Title = 'Ник записи',
+        [string] $Prompt = 'Введите никнейм, который будет добавлен в имя файлов записи.'
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $Title
+    $dlg.Size = New-Object System.Drawing.Size(460, 220)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    if ($script:AppIcon) { $dlg.Icon = $script:AppIcon }
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Prompt
+    $label.Location = New-Object System.Drawing.Point(18, 18)
+    $label.Size = New-Object System.Drawing.Size(404, 38)
+    $label.ForeColor = $colorText
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($label)
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Location = New-Object System.Drawing.Point(18, 68)
+    $txt.Size = New-Object System.Drawing.Size(404, 30)
+    $txt.BackColor = $colorInput
+    $txt.ForeColor = $colorText
+    $txt.BorderStyle = 'FixedSingle'
+    $txt.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+    $txt.Text = if ($script:SelectedNickname -and $script:SelectedNickname -ne 'untitled') { $script:SelectedNickname } else { '' }
+    $dlg.Controls.Add($txt)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = 'Недопустимые символы будут удалены, пробелы заменятся на _.'
+    $hint.Location = New-Object System.Drawing.Point(18, 104)
+    $hint.Size = New-Object System.Drawing.Size(404, 20)
+    $hint.ForeColor = $colorMuted
+    $hint.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($hint)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'Продолжить'
+    $btnOk.Location = New-Object System.Drawing.Point(226, 136)
+    $btnOk.Size = New-Object System.Drawing.Size(96, 32)
+    Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Отмена'
+    $btnCancel.Location = New-Object System.Drawing.Point(328, 136)
+    $btnCancel.Size = New-Object System.Drawing.Size(94, 32)
+    Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
+    $dlg.Controls.Add($btnCancel)
+
+    $btnOk.Add_Click({
+        $cleaned = Sanitize-Nickname $txt.Text
+        if ($cleaned -eq 'untitled') {
+            [System.Windows.Forms.MessageBox]::Show(
+                'Введите никнейм перед запуском OBS.',
+                'Ник не указан',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+        if ($cleaned -ne $txt.Text.Trim()) { $txt.Text = $cleaned }
+        $dlg.Tag = $cleaned
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dlg.Close()
+    })
+    $btnCancel.Add_Click({
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $dlg.Close()
+    })
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+    $dlg.Add_Shown({ $txt.Focus(); $txt.SelectAll() })
+
+    try {
+        if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            return (Set-SelectedNickname ([string]$dlg.Tag))
+        }
+        return $null
+    }
+    finally {
+        $dlg.Dispose()
+    }
+}
+
+function Show-LogViewerDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Логи Goodwin OBS'
+    $dlg.Size = New-Object System.Drawing.Size(900, 620)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    if ($script:AppIcon) { $dlg.Icon = $script:AppIcon }
+
+    $pathLabel = New-Object System.Windows.Forms.Label
+    $pathLabel.Text = $script:LogFile
+    $pathLabel.Location = New-Object System.Drawing.Point(16, 14)
+    $pathLabel.Size = New-Object System.Drawing.Size(850, 20)
+    $pathLabel.ForeColor = $colorMuted
+    $pathLabel.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($pathLabel)
+
+    $box = New-Object System.Windows.Forms.RichTextBox
+    $box.Location = New-Object System.Drawing.Point(16, 42)
+    $box.Size = New-Object System.Drawing.Size(850, 468)
+    $box.ReadOnly = $true
+    $box.BackColor = [System.Drawing.Color]::FromArgb(9, 12, 18)
+    $box.ForeColor = [System.Drawing.Color]::FromArgb(220, 226, 235)
+    $box.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $box.ScrollBars = 'Both'
+    $box.WordWrap = $false
+    $box.BorderStyle = 'FixedSingle'
+    $dlg.Controls.Add($box)
+
+    $loadLog = {
+        try {
+            if (Test-Path -LiteralPath $script:LogFile) {
+                $box.Text = Get-Content -Raw -Path $script:LogFile -Encoding UTF8
+            } else {
+                $box.Text = 'Лог-файл пока не создан.'
+            }
+            $box.SelectionStart = $box.TextLength
+            try { $box.ScrollToCaret() } catch {}
+        }
+        catch {
+            $box.Text = 'Не удалось прочитать лог: ' + $_.Exception.Message
+        }
+    }
+
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Text = 'Обновить'
+    $btnRefresh.Location = New-Object System.Drawing.Point(542, 526)
+    $btnRefresh.Size = New-Object System.Drawing.Size(100, 32)
+    Set-UiButtonStyle -Button $btnRefresh -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnRefresh)
+
+    $btnOpen = New-Object System.Windows.Forms.Button
+    $btnOpen.Text = 'Открыть файл'
+    $btnOpen.Location = New-Object System.Drawing.Point(648, 526)
+    $btnOpen.Size = New-Object System.Drawing.Size(110, 32)
+    Set-UiButtonStyle -Button $btnOpen -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnOpen)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = 'Закрыть'
+    $btnClose.Location = New-Object System.Drawing.Point(764, 526)
+    $btnClose.Size = New-Object System.Drawing.Size(102, 32)
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    Set-UiButtonStyle -Button $btnClose -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnClose)
+
+    $btnRefresh.Add_Click({ & $loadLog })
+    $btnOpen.Add_Click({
+        try {
+            if (-not (Test-Path -LiteralPath $script:LogFile)) {
+                Add-LogFileLine ("[{0}] Лог-файл создан по запросу пользователя." -f (Get-Date -Format 'HH:mm:ss'))
+            }
+            Start-Process -FilePath notepad.exe -ArgumentList $script:LogFile
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                ('Не удалось открыть лог-файл: ' + $_.Exception.Message),
+                'Логи',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+    })
+
+    & $loadLog
+    [void]$dlg.ShowDialog($form)
+    $dlg.Dispose()
+}
+
+$openRecordingFolderSettings = {
     if ($script:IsBusy) { return }
     try {
         $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -4804,11 +5519,14 @@ $btnPath.Add_Click({
             $script:RecordingDir  = $script:RecordingRoot
             $txtPath.Text = $script:RecordingRoot
             Save-CurrentSettings
+            Reset-RecordingMonitor
+            Update-OverviewState
             Write-Step "Папка записей изменена: $script:RecordingRoot"
         }
     }
     catch { Write-ErrorDetails -Context 'Выбор папки записей' -ErrorRecord $_ }
-})
+}
+Set-SettingsFieldClick $txtPath $openRecordingFolderSettings
 
 # ── Проверка доступности выбранных устройств ───────────────────────────────
 function Confirm-DeviceAvailability {
@@ -4844,11 +5562,11 @@ function Confirm-DeviceAvailability {
 $btnInstall.Add_Click({
     if ($script:IsBusy) { return }
 
-    # Гарантируем, что у никнейма есть значение (untitled по умолчанию)
-    $cleaned = Sanitize-Nickname $txtNick.Text
-    if ($cleaned -ne $txtNick.Text) { $txtNick.Text = $cleaned }
-    $script:SelectedNickname = $cleaned
+    if ([string]::IsNullOrWhiteSpace($script:SelectedNickname)) {
+        $script:SelectedNickname = 'untitled'
+    }
     Save-CurrentSettings
+    Update-OverviewState
 
     if (-not (Confirm-DeviceAvailability)) {
         Set-Status 'Установка отменена: устройство недоступно.' 'Yellow'
@@ -4869,11 +5587,13 @@ $btnInstall.Add_Click({
         if (Test-DropboxAccess) {
             Write-Step '✓ Доступ к Dropbox подтверждён'
         } else {
-            Write-Step '⚠ Не удалось подтвердить доступ к Dropbox (см. техлог)'
+            Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
         }
 
         Set-Status 'OBS установлен. Нажмите «Запустить».' 'Green'
+        $script:ObsLaunchCompleted = $false
         Enable-Button $btnLaunch
+        Update-OverviewState
     }
     catch {
         Write-ErrorDetails -Context 'Установка OBS' -ErrorRecord $_
@@ -4889,9 +5609,16 @@ $btnInstall.Add_Click({
 # ── Кнопка «Запустить» ─────────────────────────────────────────────────────
 $btnLaunch.Add_Click({
     if ($script:IsBusy) { return }
+
+    $nickname = Show-NicknameDialog
+    if ([string]::IsNullOrWhiteSpace($nickname)) {
+        Set-Status 'Запуск отменён: ник не указан.' 'Yellow'
+        return
+    }
+
     $script:IsBusy = $true
     Disable-Button $btnLaunch
-    Set-Status 'Запускаем OBS...' 'Yellow'
+    Set-Status 'Применяем настройки OBS...' 'Yellow'
     try {
         $obsRunning = Get-Process -Name 'obs64' -ErrorAction SilentlyContinue
         if ($obsRunning) {
@@ -4912,9 +5639,14 @@ $btnLaunch.Add_Click({
             $obsRunning | Stop-Process -Force
             Start-Sleep -Seconds 2
         }
+        Set-PortableObsConfig
+        Set-Status 'Запускаем OBS...' 'Yellow'
         Start-PortableObs
+        $script:ObsLaunchCompleted = $true
+        Set-ButtonBlink $btnLaunch $false
         Set-Status 'OBS запущен. После записи нажмите «Загрузить».' 'Green'
         Enable-Button $btnUpload
+        Update-OverviewState
     }
     catch {
         Write-ErrorDetails -Context 'Запуск OBS' -ErrorRecord $_
@@ -4930,11 +5662,18 @@ $btnLaunch.Add_Click({
 $btnUpload.Add_Click({
     if ($script:IsBusy) { return }
 
-    # Никнейм всегда есть (untitled по умолчанию); используем его как префикс
-    $cleaned = Sanitize-Nickname $txtNick.Text
-    if ($cleaned -ne $txtNick.Text) { $txtNick.Text = $cleaned }
-    $script:SelectedNickname = $cleaned
-    Save-CurrentSettings
+    $cleaned = Sanitize-Nickname $script:SelectedNickname
+    if ($cleaned -eq 'untitled') {
+        $cleaned = Show-NicknameDialog -Title 'Ник записей' -Prompt 'Введите никнейм, по которому будут выбраны файлы записи.'
+        if ([string]::IsNullOrWhiteSpace($cleaned)) {
+            Set-Status 'Загрузка отменена: ник не указан.' 'Yellow'
+            return
+        }
+    } else {
+        $script:SelectedNickname = $cleaned
+        Save-CurrentSettings
+        Update-OverviewState
+    }
     $prefix = $cleaned
 
     $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -5023,13 +5762,10 @@ $btnUpload.Add_Click({
     $script:IsUploading = $true
     $form.Text = '⚠ ЗАГРУЗКА — НЕ ЗАКРЫВАЙТЕ!'
     Set-Status '⚠ НЕ ЗАКРЫВАЙТЕ ОКНО! Идёт загрузка записей...' 'Yellow'
+    if ($script:UploadStateLabel_ref) { $script:UploadStateLabel_ref.Text = 'Загрузка' }
+    if ($script:UploadHintLabel_ref) { $script:UploadHintLabel_ref.Text = "Файлов: $($filesToUpload.Count)" }
 
-    $warnBorder = '╔' + ('═' * 50) + '╗'
-    $warnEnd    = '╚' + ('═' * 50) + '╝'
-    Write-Step $warnBorder
-    Write-Step '║  ⚠  НЕ ЗАКРЫВАЙТЕ ЭТО ОКНО ДО КОНЦА ЗАГРУЗКИ!  ║'
-    Write-Step '║     Загрузка может занять от 10 до 60 минут      ║'
-    Write-Step $warnEnd
+    Write-Step 'Не закрывайте окно до конца загрузки. Загрузка может занять от 10 до 60 минут.'
 
     try {
         $uploadStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -5040,13 +5776,18 @@ $btnUpload.Add_Click({
         $elapsedStr = '{0:00}:{1:00}:{2:00}' -f $elapsed.Hours, $elapsed.Minutes, $elapsed.Seconds
         Write-Step "Время загрузки: $elapsedStr"
 
+        Reset-RecordingMonitor
         Set-Status '✓ Все записи успешно загружены!' 'Green'
+        if ($script:UploadStateLabel_ref) { $script:UploadStateLabel_ref.Text = 'Загружено' }
+        if ($script:UploadHintLabel_ref) { $script:UploadHintLabel_ref.Text = "Время загрузки: $elapsedStr" }
         Write-Step 'Готово!'
     }
     catch {
         Clear-UploadProgress
         Write-ErrorDetails -Context 'Загрузка записей' -ErrorRecord $_
         Set-Status 'Ошибка загрузки. Можно нажать повторно.' 'Red'
+        if ($script:UploadStateLabel_ref) { $script:UploadStateLabel_ref.Text = 'Ошибка загрузки' }
+        if ($script:UploadHintLabel_ref) { $script:UploadHintLabel_ref.Text = 'Подробности доступны через кнопку «Логи»' }
     }
     finally {
         $script:IsUploading = $false
@@ -5075,6 +5816,7 @@ $btnUpload.Add_Click({
                 Write-Step 'OBS оставлен на месте для повторной записи.'
             }
         }
+        Update-OverviewState
     }
 })
 
@@ -5098,11 +5840,13 @@ $btnFresh.Add_Click({
         if (Test-DropboxAccess) {
             Write-Step '✓ Доступ к Dropbox подтверждён'
         } else {
-            Write-Step '⚠ Не удалось подтвердить доступ к Dropbox (см. техлог)'
+            Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
         }
 
         Set-Status 'OBS установлен чисто.' 'Green'
+        $script:ObsLaunchCompleted = $false
         Enable-Button $btnLaunch
+        Update-OverviewState
     } catch {
         Write-ErrorDetails -Context 'Чистая установка OBS' -ErrorRecord $_
         Set-Status ('Ошибка чистой установки: ' + $_.Exception.Message) 'Red'
@@ -5121,7 +5865,9 @@ $btnClean.Add_Click({
     if (Test-Path $InstallDir) { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Step "Удалено $InstallDir" }
     if (Test-Path $TempRoot)   { Remove-Item -LiteralPath $TempRoot   -Recurse -Force -ErrorAction SilentlyContinue }
     Set-Status 'Очистка выполнена.' 'Green'
+    $script:ObsLaunchCompleted = $false
     Disable-Button $btnLaunch
+    Update-OverviewState
 })
 
 # ── Кнопка «Открыть папку записей» ─────────────────────────────────────────
@@ -5136,6 +5882,15 @@ $btnFolder.Add_Click({
         }
     }
     catch { Write-ErrorDetails -Context 'Открыть папку записей' -ErrorRecord $_ }
+})
+
+# ── Кнопка «Логи» ───────────────────────────────────────────────────────────
+$btnLogs.Add_Click({
+    try { Show-LogViewerDialog }
+    catch {
+        Write-ErrorDetails -Context 'Просмотр логов' -ErrorRecord $_
+        Set-Status ('Не удалось открыть логи: ' + $_.Exception.Message) 'Red'
+    }
 })
 
 # ── Закрытие окна (защита от закрытия во время загрузки) ──────────────────
@@ -5169,23 +5924,20 @@ $form.Add_FormClosing({
     }
     # Гарантированно останавливаем предпросмотр камеры (освобождаем COM-граф/устройство).
     try { [GoodwinCam.CameraPreview]::Stop() } catch {}
+    try { if ($script:StateTimer) { $script:StateTimer.Stop(); $script:StateTimer.Dispose() } } catch {}
     if (Test-Path $TempRoot) {
         Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 })
 
-# Пустая строка-отступ перед ASCII-приветствием — БЕЗ таймстампа (это часть welcome-блока,
-# а не лог-сообщение). Иначе первой строкой лога был бы голый «[чч:мм:сс] ».
-if ($script:LogBox) { $script:LogBox.AppendText("`r`n") } else { Write-Host '' }
-
 # Привязываем иконку и предупреждение к окну PowerShell-консоли, после чего сворачиваем его
 try {
     if ($script:AppIcon) { [ConsoleHelper]::SetConsoleIcon($script:AppIcon.Handle) }
-    try { $Host.UI.RawUI.WindowTitle = 'Goodwin OBS — тех. лог (не закрывать!)' } catch {}
+    try { $Host.UI.RawUI.WindowTitle = 'Goodwin OBS — процесс приложения' } catch {}
     Write-Host ''
     Write-Host '╔══════════════════════════════════════════════════════════╗' -ForegroundColor Yellow
     Write-Host '║  НЕ ЗАКРЫВАЙТЕ ЭТО ОКНО!                                 ║' -ForegroundColor Yellow
-    Write-Host '║  Здесь идут технические логи Goodwin OBS.                ║' -ForegroundColor Yellow
+    Write-Host '║  Основные логи пишутся в файл и доступны кнопкой Логи.   ║' -ForegroundColor Yellow
     Write-Host '║  Окно можно свернуть — но не закрывайте,                 ║' -ForegroundColor Yellow
     Write-Host '║  иначе приложение завершится.                            ║' -ForegroundColor Yellow
     Write-Host '╚══════════════════════════════════════════════════════════╝' -ForegroundColor Yellow
@@ -5193,49 +5945,7 @@ try {
     [ConsoleHelper]::MinimizeConsole()
 } catch {}
 
-# Dota-style ASCII-арт приветствие
-function Show-GoodwinAsciiArt {
-    if (-not $script:LogBox) { return }
-
-    $art = @(
-        ''
-        '  ╔══════════════════════════════════════════════════╗'
-        '  ║                                                  ║'
-        '  ║   █████ █████ █████ ████  █   █ █████ █   █      ║'
-        '  ║   █     █   █ █   █ █   █ █   █   █   ██  █      ║'
-        '  ║   █ ███ █   █ █   █ █   █ █ █ █   █   █ █ █      ║'
-        '  ║   █   █ █   █ █   █ █   █ ██ ██   █   █  ██      ║'
-        '  ║   █████ █████ █████ ████  █   █ █████ █   █      ║'
-        '  ║                                                  ║'
-        '  ║              ⚔  O B S   S E T U P  ⚔             ║'
-        '  ║                                                  ║'
-        '  ╚══════════════════════════════════════════════════╝'
-        ''
-    )
-
-    # Полностью жёлтый ASCII-арт (приветствие)
-    $yellow     = [System.Drawing.Color]::FromArgb(230, 200, 80)
-    $boldFont   = New-Object System.Drawing.Font('Consolas', 9, [System.Drawing.FontStyle]::Bold)
-    $normalFont = New-Object System.Drawing.Font('Consolas', 9)
-
-    foreach ($line in $art) {
-        $script:LogBox.SelectionStart = $script:LogBox.TextLength
-        $script:LogBox.SelectionColor = $yellow
-        if ($line -match '███|⚔') {
-            $script:LogBox.SelectionFont = $boldFont
-        } else {
-            $script:LogBox.SelectionFont = $normalFont
-        }
-        $script:LogBox.AppendText($line + "`r`n")
-    }
-
-    $script:LogBox.SelectionStart = $script:LogBox.TextLength
-    $script:LogBox.SelectionColor = [System.Drawing.Color]::FromArgb(210, 210, 210)
-    $script:LogBox.SelectionFont  = $normalFont
-    [System.Windows.Forms.Application]::DoEvents()
-}
-
-Show-GoodwinAsciiArt
+Write-Log 'Goodwin OBS запущен'
 if ($script:SelectedNickname -and $script:SelectedNickname -ne 'untitled') {
     Write-Step "Загружены настройки: никнейм = $script:SelectedNickname"
 }
