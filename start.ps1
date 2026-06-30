@@ -1,0 +1,5903 @@
+$ErrorActionPreference = 'Stop'
+
+# ═══════════════════════════════════════════════════
+# Кириллица: принудительный UTF-8
+# ═══════════════════════════════════════════════════
+# PowerShell 5.1 по умолчанию ЧИТАЕТ текстовые файлы в системной ANSI-кодировке
+# (cp1251/cp1252/…), а НЕ в UTF-8. Конфиги OBS (basic.ini, user.ini, JSON сцен)
+# и значения с кириллицей (никнейм, путь записи) хранятся в UTF-8 — поэтому без
+# явного UTF-8 при чтении русские буквы превращаются в «кракозябры» (фыва→С„РІ…),
+# а двойная перезапись закрепляет их в файле. Включаем UTF-8 по умолчанию для
+# чтения и для консоли, чтобы кириллица в путях и никнеймах не ломалась.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+try { [Console]::InputEncoding  = New-Object System.Text.UTF8Encoding($false) } catch {}
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8'
+
+# ═══════════════════════════════════════════════════
+# Win32 API: скрытие консольного окна
+# ═══════════════════════════════════════════════════
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class ConsoleHelper {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+    public const int SW_MINIMIZE = 6;
+    public const int WM_SETICON  = 0x0080;
+    public const int ICON_SMALL  = 0;
+    public const int ICON_BIG    = 1;
+    public static void MinimizeConsole() {
+        IntPtr h = GetConsoleWindow();
+        if (h != IntPtr.Zero) ShowWindow(h, SW_MINIMIZE);
+    }
+    public static void SetConsoleIcon(IntPtr hIcon) {
+        IntPtr h = GetConsoleWindow();
+        if (h != IntPtr.Zero && hIcon != IntPtr.Zero) {
+            SendMessage(h, WM_SETICON, (IntPtr)ICON_SMALL, hIcon);
+            SendMessage(h, WM_SETICON, (IntPtr)ICON_BIG,   hIcon);
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
+# ── AppUserModelID: без этого Windows ставит на taskbar иконку powershell.exe.
+# Должен быть вызван ДО создания любого окна (формы или консоли).
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class WinAppId {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    public static extern void SetCurrentProcessExplicitAppUserModelID(
+        [MarshalAs(UnmanagedType.LPWStr)] string AppID);
+}
+'@ -ErrorAction SilentlyContinue
+try { [WinAppId]::SetCurrentProcessExplicitAppUserModelID('Goodwin.OBS.App') } catch {}
+
+# Глобальный флаг: идёт загрузка (блокирует закрытие окна)
+$script:IsUploading = $false
+# Глобальный флаг: любая операция (reentrancy guard)
+$script:IsBusy = $false
+
+# Загружаем System.Net.Http один раз (для chunked upload)
+Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+
+# Проверка STA-режима для WinForms
+if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if (-not $scriptPath) {
+        # Запуск через irm | iex — сохраняем скрипт в штатную директорию
+        $InstallDir = Join-Path $env:USERPROFILE 'Downloads\CustomOBS'
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        $scriptPath = Join-Path $InstallDir 'goodwin_obs.ps1'
+        $scriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
+        [IO.File]::WriteAllText($scriptPath, $scriptContent, [Text.Encoding]::UTF8)
+    }
+    if (Test-Path $scriptPath) {
+        Start-Process powershell.exe -WindowStyle Minimized -ArgumentList '-STA','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`""
+        exit
+    } else {
+        Write-Host 'Запустите скрипт в STA-режиме: powershell -STA -File goodwin_obs.ps1'
+        exit
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Скрипт работает открыто: без скрытых окон, без зашифрованных или обфусцированных
+# блоков, без изменения настроек антивируса. Настройки OBS встроены в скрипт.
+# Dropbox access token получается через официальный OAuth API; для публичной
+# раздачи скрипта лучше вынести OAuth-секреты и refresh token на сервер.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dropbox OAuth: значения зашифрованы и расшифровываются ключом из GOODWIN_OBS_KEY.
+$script:DropboxOAuthEncrypted = @{
+    k = 'v1:e4lHo3yR7K+epx0VWmli+Q==:LCWV7f4lquLsxhNQckm6kQ==:uWbp9RS6lMSrwibtodMPhQ=='
+    s = 'v1:xXugp2z9JVGHXuGEeo0SNQ==:YfFlAXKN1cjZ5ks+0isK4A==:pWV7bOiPNoKEs4eVusFZOw=='
+    r = 'v1:OTds3siySL+CqvtN5ae54w==:4uwtfoxil3wVVavGaCSmjQ==:X76yvUwQxErfKqRpEBV9uNTQeU3P+wNJStS0FgADH4d+gss5e2OqonWo5rMyeew9Vk+Fz0Eaz6KUW29qf79JrLKRCoIG/38RFh1oVOmH2YU='
+}
+$script:DropboxOAuthConfig = $null
+$script:DropboxRuntimeRefreshToken = $null
+$DropboxUploadFolderPath = '/Goodwin'
+
+# ── Пути установки, записи и локального хранилища ────────────────────────────
+$InstallDir               = Join-Path $env:USERPROFILE 'Downloads\CustomOBS'
+$script:RecordingRoot     = Join-Path $env:USERPROFILE 'Downloads\goodwin_record'
+$script:RecordingDir      = $script:RecordingRoot
+$script:SettingsFile      = Join-Path $env:APPDATA 'goodwin_obs\settings.json'
+$script:UploadHistoryFile = Join-Path $env:APPDATA 'goodwin_obs\uploaded.json'
+$script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
+$script:UploadProgressActive = $false
+$ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
+$TempRoot = Join-Path $InstallDir '.tmp_install'
+$script:BundledObsSceneCollectionFile = 'goodwin_obs.json'
+$script:BundledObsSceneCollectionJson = @'
+{
+    "name": "goodwin_obs",
+    "DesktopAudioDevice1": {
+        "prev_ver": 536936450,
+        "name": "Desktop Audio",
+        "uuid": "14b84844-a41c-4a89-92e4-c5beaac9f405",
+        "id": "wasapi_output_capture",
+        "versioned_id": "wasapi_output_capture",
+        "settings": {
+            "device_id": "default"
+        },
+        "mixers": 192,
+        "sync": 0,
+        "flags": 0,
+        "volume": 1.0,
+        "balance": 0.5,
+        "enabled": true,
+        "muted": true,
+        "push-to-mute": false,
+        "push-to-mute-delay": 0,
+        "push-to-talk": false,
+        "push-to-talk-delay": 0,
+        "hotkeys": {
+            "libobs.mute": [],
+            "libobs.unmute": [],
+            "libobs.push-to-mute": [],
+            "libobs.push-to-talk": []
+        },
+        "deinterlace_mode": 0,
+        "deinterlace_field_order": 0,
+        "monitoring_type": 0,
+        "private_settings": {
+            "mixer_hidden": false
+        }
+    },
+    "AuxAudioDevice1": {
+        "prev_ver": 536936450,
+        "name": "Mic/Aux",
+        "uuid": "4c516bf1-0245-4a6f-bab5-87458c011cdc",
+        "id": "wasapi_input_capture",
+        "versioned_id": "wasapi_input_capture",
+        "settings": {
+            "device_id": "{0.0.1.00000000}.{6a796c73-49ac-480b-98fa-f1a6ba380cf3}"
+        },
+        "mixers": 195,
+        "sync": 0,
+        "flags": 2,
+        "volume": 0.7638749480247498,
+        "balance": 0.5,
+        "enabled": true,
+        "muted": false,
+        "push-to-mute": false,
+        "push-to-mute-delay": 0,
+        "push-to-talk": false,
+        "push-to-talk-delay": 0,
+        "hotkeys": {
+            "libobs.mute": [],
+            "libobs.unmute": [],
+            "libobs.push-to-mute": [],
+            "libobs.push-to-talk": []
+        },
+        "deinterlace_mode": 0,
+        "deinterlace_field_order": 0,
+        "monitoring_type": 0,
+        "private_settings": {}
+    },
+    "sources": [
+        {
+            "prev_ver": 536936450,
+            "name": "Webcam",
+            "uuid": "2891b909-0491-4305-93bf-ef9f39c8e2a0",
+            "id": "dshow_input",
+            "versioned_id": "dshow_input",
+            "settings": {
+                "video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+                "last_video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": true,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "libobs.mute": [],
+                "libobs.unmute": [],
+                "libobs.push-to-mute": [],
+                "libobs.push-to-talk": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 536936450,
+            "name": "DISCORD",
+            "uuid": "58da036f-6a16-4e82-9074-9b1ecd1262db",
+            "id": "wasapi_process_output_capture",
+            "versioned_id": "wasapi_process_output_capture",
+            "settings": {
+                "window": "@goosyarajkee - Discord:Chrome_WidgetWin_1:Discord.exe",
+                "priority": 2
+            },
+            "mixers": 197,
+            "sync": 0,
+            "flags": 0,
+            "volume": 0.7988331913948059,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "libobs.mute": [],
+                "libobs.unmute": [],
+                "libobs.push-to-mute": [],
+                "libobs.push-to-talk": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 536936450,
+            "name": "DOTA",
+            "uuid": "b1e7afaf-6c89-4bad-916c-e22d895fd4d5",
+            "id": "game_capture",
+            "versioned_id": "game_capture",
+            "settings": {
+                "capture_audio": true,
+                "window": "Dota 2:SDL_app:dota2.exe",
+                "capture_mode": "window"
+            },
+            "mixers": 201,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "libobs.mute": [],
+                "libobs.unmute": [],
+                "libobs.push-to-mute": [],
+                "libobs.push-to-talk": [],
+                "hotkey_start": [],
+                "hotkey_stop": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 536936450,
+            "name": "Раскраски",
+            "uuid": "a26f1c9c-96cb-426a-b00b-7218ef1102f7",
+            "id": "game_capture",
+            "versioned_id": "game_capture",
+            "settings": {
+                "capture_mode": "window",
+                "window": "Chameleon  :UnrealWindow:PenguinHotel-Win64-Shipping.exe",
+                "capture_audio": true
+            },
+            "mixers": 201,
+            "sync": 0,
+            "flags": 0,
+            "volume": 0.7952919006347656,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "libobs.mute": [],
+                "libobs.unmute": [],
+                "libobs.push-to-mute": [],
+                "libobs.push-to-talk": [],
+                "hotkey_start": [],
+                "hotkey_stop": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 536936450,
+            "name": "PUBG",
+            "uuid": "67ad3bc4-2552-4474-a3d3-dfe554778e0b",
+            "id": "game_capture",
+            "versioned_id": "game_capture",
+            "settings": {
+                "capture_mode": "window",
+                "window": "PUBG#3A BATTLEGROUNDS :UnrealWindow:TslGame.exe",
+                "capture_audio": true
+            },
+            "mixers": 201,
+            "sync": 0,
+            "flags": 0,
+            "volume": 0.7952919006347656,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "libobs.mute": [],
+                "libobs.unmute": [],
+                "libobs.push-to-mute": [],
+                "libobs.push-to-talk": [],
+                "hotkey_start": [],
+                "hotkey_stop": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 536936450,
+            "name": "Minecraft",
+            "uuid": "b4c16491-51f3-4797-9aaf-4880cb76208c",
+            "id": "game_capture",
+            "versioned_id": "game_capture",
+            "settings": {
+                "capture_mode": "window",
+                "window": "Minecraft 26.2:GLFW30:javaw.exe",
+                "capture_audio": true
+            },
+            "mixers": 201,
+            "sync": 0,
+            "flags": 0,
+            "volume": 0.7952919006347656,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "libobs.mute": [],
+                "libobs.unmute": [],
+                "libobs.push-to-mute": [],
+                "libobs.push-to-talk": [],
+                "hotkey_start": [],
+                "hotkey_stop": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "private_settings": {}
+        },
+        {
+            "prev_ver": 536936450,
+            "name": "goodwin",
+            "uuid": "a75f2deb-3eed-41ea-adaf-dc21aac37d90",
+            "id": "scene",
+            "versioned_id": "scene",
+            "settings": {
+                "custom_size": false,
+                "id_counter": 10,
+                "items": [
+                    {
+                        "name": "DISCORD",
+                        "source_uuid": "58da036f-6a16-4e82-9074-9b1ecd1262db",
+                        "visible": true,
+                        "locked": false,
+                        "rot": 0.0,
+                        "scale_ref": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "align": 5,
+                        "bounds_type": 0,
+                        "bounds_align": 0,
+                        "bounds_crop": false,
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 3,
+                        "group_item_backup": false,
+                        "pos": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "pos_rel": {
+                            "x": -1.7777777910232544,
+                            "y": -1.0
+                        },
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "scale_rel": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "bounds": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "bounds_rel": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 0
+                        },
+                        "hide_transition": {
+                            "duration": 0
+                        },
+                        "private_settings": {}
+                    },
+                    {
+                        "name": "PUBG",
+                        "source_uuid": "67ad3bc4-2552-4474-a3d3-dfe554778e0b",
+                        "visible": true,
+                        "locked": false,
+                        "rot": 0.0,
+                        "scale_ref": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "align": 5,
+                        "bounds_type": 0,
+                        "bounds_align": 0,
+                        "bounds_crop": false,
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 9,
+                        "group_item_backup": false,
+                        "pos": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "pos_rel": {
+                            "x": -1.7777777910232544,
+                            "y": -1.0
+                        },
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "scale_rel": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "bounds": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "bounds_rel": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 300
+                        },
+                        "hide_transition": {
+                            "duration": 300
+                        },
+                        "private_settings": {}
+                    },
+                    {
+                        "name": "Раскраски",
+                        "source_uuid": "a26f1c9c-96cb-426a-b00b-7218ef1102f7",
+                        "visible": true,
+                        "locked": false,
+                        "rot": 0.0,
+                        "scale_ref": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "align": 5,
+                        "bounds_type": 0,
+                        "bounds_align": 0,
+                        "bounds_crop": false,
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 8,
+                        "group_item_backup": false,
+                        "pos": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "pos_rel": {
+                            "x": -1.7777777910232544,
+                            "y": -1.0
+                        },
+                        "scale": {
+                            "x": 0.75,
+                            "y": 0.75
+                        },
+                        "scale_rel": {
+                            "x": 0.75,
+                            "y": 0.75
+                        },
+                        "bounds": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "bounds_rel": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 300
+                        },
+                        "hide_transition": {
+                            "duration": 300
+                        },
+                        "private_settings": {}
+                    },
+                    {
+                        "name": "DOTA",
+                        "source_uuid": "b1e7afaf-6c89-4bad-916c-e22d895fd4d5",
+                        "visible": true,
+                        "locked": false,
+                        "rot": 0.0,
+                        "scale_ref": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "align": 5,
+                        "bounds_type": 1,
+                        "bounds_align": 5,
+                        "bounds_crop": false,
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 2,
+                        "group_item_backup": false,
+                        "pos": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "pos_rel": {
+                            "x": -1.7777777910232544,
+                            "y": -1.0
+                        },
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "scale_rel": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "bounds": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "bounds_rel": {
+                            "x": 3.555555582046509,
+                            "y": 2.0
+                        },
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 0
+                        },
+                        "hide_transition": {
+                            "duration": 0
+                        },
+                        "private_settings": {}
+                    },
+                    {
+                        "name": "Webcam",
+                        "source_uuid": "2891b909-0491-4305-93bf-ef9f39c8e2a0",
+                        "visible": true,
+                        "locked": false,
+                        "rot": 0.0,
+                        "scale_ref": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "align": 5,
+                        "bounds_type": 2,
+                        "bounds_align": 5,
+                        "bounds_crop": false,
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 7,
+                        "group_item_backup": false,
+                        "pos": {
+                            "x": 0.0,
+                            "y": 800.0
+                        },
+                        "pos_rel": {
+                            "x": -1.7777777910232544,
+                            "y": 0.4814814329147339
+                        },
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "scale_rel": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "bounds": {
+                            "x": 498.0,
+                            "y": 280.0
+                        },
+                        "bounds_rel": {
+                            "x": 0.9222221970558167,
+                            "y": 0.5185185074806213
+                        },
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 0
+                        },
+                        "hide_transition": {
+                            "duration": 0
+                        },
+                        "private_settings": {}
+                    },
+                    {
+                        "name": "Minecraft",
+                        "source_uuid": "b4c16491-51f3-4797-9aaf-4880cb76208c",
+                        "visible": true,
+                        "locked": false,
+                        "rot": 0.0,
+                        "scale_ref": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "align": 5,
+                        "bounds_type": 0,
+                        "bounds_align": 0,
+                        "bounds_crop": false,
+                        "crop_left": 0,
+                        "crop_top": 0,
+                        "crop_right": 0,
+                        "crop_bottom": 0,
+                        "id": 10,
+                        "group_item_backup": false,
+                        "pos": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "pos_rel": {
+                            "x": -1.7777777910232544,
+                            "y": -1.0
+                        },
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "scale_rel": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "bounds": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "bounds_rel": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "scale_filter": "disable",
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "show_transition": {
+                            "duration": 300
+                        },
+                        "hide_transition": {
+                            "duration": 300
+                        },
+                        "private_settings": {}
+                    }
+                ]
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false,
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "hotkeys": {
+                "OBSBasic.SelectScene": [],
+                "libobs.show_scene_item.3": [],
+                "libobs.hide_scene_item.3": [],
+                "libobs.show_scene_item.2": [],
+                "libobs.hide_scene_item.2": [],
+                "libobs.show_scene_item.7": [],
+                "libobs.hide_scene_item.7": [],
+                "libobs.show_scene_item.8": [],
+                "libobs.hide_scene_item.8": [],
+                "libobs.show_scene_item.9": [],
+                "libobs.hide_scene_item.9": [],
+                "libobs.show_scene_item.10": [],
+                "libobs.hide_scene_item.10": []
+            },
+            "deinterlace_mode": 0,
+            "deinterlace_field_order": 0,
+            "monitoring_type": 0,
+            "canvas_uuid": "6c69626f-6273-4c00-9d88-c5136d61696e",
+            "private_settings": {}
+        }
+    ],
+    "groups": [],
+    "scene_order": [
+        {
+            "name": "goodwin"
+        }
+    ],
+    "current_scene": "goodwin",
+    "current_program_scene": "goodwin",
+    "canvases": [],
+    "current_transition": "Затухание",
+    "transition_duration": 300,
+    "transitions": [],
+    "quick_transitions": [],
+    "saved_projectors": [],
+    "preview_locked": false,
+    "scaling_enabled": false,
+    "scaling_level": -6,
+    "scaling_off_x": 0.0,
+    "scaling_off_y": 0.0,
+    "virtual-camera": {
+        "type2": 3
+    },
+    "modules": {
+        "auto-scene-switcher": {
+            "interval": 300,
+            "non_matching_scene": "",
+            "switch_if_not_matching": false,
+            "active": false,
+            "switches": []
+        },
+        "captions": {
+            "source": "",
+            "enabled": false,
+            "lang_id": 1049,
+            "provider": "mssapi"
+        },
+        "output-timer": {
+            "streamTimerHours": 0,
+            "streamTimerMinutes": 0,
+            "streamTimerSeconds": 30,
+            "recordTimerHours": 0,
+            "recordTimerMinutes": 0,
+            "recordTimerSeconds": 30,
+            "autoStartStreamTimer": false,
+            "autoStartRecordTimer": false,
+            "pauseRecordTimer": true
+        },
+        "scripts-tool": []
+    },
+    "resolution": {
+        "x": 1920,
+        "y": 1080
+    },
+    "migration_resolution": {
+        "x": 1920,
+        "y": 1080
+    },
+    "version": 2
+}
+'@
+$script:BundledObsProfilesZipBase64 = @'
+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
+X21lZGl1bS9zdHJlYW1FbmNvZGVyLmpzb24uYmFrUEsBAhQAFAAAAAgACozeXDkzSBJ/AwAAjQcAABUAAAAAAAAAAAAAAAAAwBoAAG52aWRpYV9oaWdoL2Jh
+c2ljLmluaVBLAQIUABQAAAAIAAqM3lwM9X+KPwAAAEIAAAAeAAAAAAAAAAAAAAAAAHIeAABudmlkaWFfaGlnaC9yZWNvcmRFbmNvZGVyLmpzb25QSwECFAAU
+AAAACAAKjN5caFv/WjwAAAA/AAAAIgAAAAAAAAAAAAAAAADtHgAAbnZpZGlhX2hpZ2gvcmVjb3JkRW5jb2Rlci5qc29uLmJha1BLAQIUABQAAAAIAAqM3lyL
+v+tIfQMAAIwHAAAUAAAAAAAAAAAAAAAAAGkfAABudmlkaWFfbG93L2Jhc2ljLmluaVBLAQIUABQAAAAIAAqM3lzfz2kPQAAAAEIAAAAdAAAAAAAAAAAAAAAA
+ABgjAABudmlkaWFfbG93L3JlY29yZEVuY29kZXIuanNvblBLAQIUABQAAAAIAAqM3lzrsvqGdQMAAH8HAAAXAAAAAAAAAAAAAAAAAJMjAABudmlkaWFfbWVk
+aXVtL2Jhc2ljLmluaVBLAQIUABQAAAAIAAqM3lzq7HClPAAAAD8AAAAgAAAAAAAAAAAAAAAAAD0nAABudmlkaWFfbWVkaXVtL3JlY29yZEVuY29kZXIuanNv
+blBLAQIUABQAAAAIAAqM3lwM9X+KPwAAAEIAAAAkAAAAAAAAAAAAAAAAALcnAABudmlkaWFfbWVkaXVtL3JlY29yZEVuY29kZXIuanNvbi5iYWtQSwUGAAAA
+ABwAHADrBwAAOCgAAAAA
+'@
+
+# Прогресс загрузки: одна строка состояния на каждый параллельно загружаемый
+# файл в памяти; агрегированный прогресс выводится в нижнюю строку состояния.
+# $script:MultiProgressState: [ordered]@{ FileName -> @{ Uploaded; Total; Status } }
+$script:MultiProgressState = $null
+$script:MultiProgressLineCount = 0
+$script:RecentActivity = New-Object System.Collections.Generic.List[string]
+
+function Add-LogFileLine {
+    param([string] $Line)
+    try {
+        $dir = Split-Path -Parent $script:LogFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+        Add-Content -Path $script:LogFile -Value $Line -Encoding UTF8
+    }
+    catch {
+        # Лог не должен ломать основную работу приложения.
+    }
+}
+
+function Format-UiText {
+    param([string] $Text, [int] $MaxLength = 92)
+    if ($null -eq $Text) { return '' }
+    $clean = ($Text -replace '\s+', ' ').Trim()
+    if ($clean.Length -le $MaxLength) { return $clean }
+    return ($clean.Substring(0, [math]::Max(0, $MaxLength - 3)) + '...')
+}
+
+function Refresh-ActivityUi {
+    if (-not $script:ActivityLabels) { return }
+    for ($i = 0; $i -lt $script:ActivityLabels.Count; $i++) {
+        $label = $script:ActivityLabels[$i]
+        if (-not $label) { continue }
+        if ($i -lt $script:RecentActivity.Count) {
+            $label.Text = Format-UiText $script:RecentActivity[$i] 86
+            $label.ForeColor = if ($i -eq 0) {
+                [System.Drawing.Color]::FromArgb(238, 242, 247)
+            } else {
+                [System.Drawing.Color]::FromArgb(154, 164, 178)
+            }
+        } else {
+            $label.Text = ''
+        }
+    }
+}
+
+function Add-ActivityItem {
+    param([string] $Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    $script:RecentActivity.Insert(0, $Message)
+    while ($script:RecentActivity.Count -gt 6) {
+        $script:RecentActivity.RemoveAt($script:RecentActivity.Count - 1)
+    }
+    Refresh-ActivityUi
+}
+
+function Set-UploadProgressUi {
+    param(
+        [int] $Percent,
+        [string] $Title,
+        [string] $Detail,
+        [string[]] $Rows
+    )
+
+    $text = "{0}: {1}% — {2}" -f $Title, ([math]::Min(100, [math]::Max(0, $Percent))), $Detail
+    $color = if ($Percent -ge 100) { 'Green' } else { 'Yellow' }
+    Set-Status (Format-UiText $text 132) $color
+    try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+}
+
+function Clear-UploadProgress {
+    $script:MultiProgressLineCount = 0
+    $script:MultiProgressState = $null
+    $script:UploadProgressActive = $false
+}
+
+function Initialize-MultiProgress {
+    param([string[]] $Names)
+    $script:MultiProgressState = [ordered]@{}
+    foreach ($n in $Names) {
+        $script:MultiProgressState[$n] = @{ Uploaded = 0L; Total = 0L; Status = 'pending' }
+    }
+    $script:MultiProgressLineCount = 0
+    $script:UploadProgressActive = $true
+    Update-MultiProgressRender -Force
+}
+
+function Write-Step {
+    param([string] $Message)
+    $ts = Get-Date -Format 'HH:mm:ss'
+    $line = "[$ts] $Message"
+    Write-Host "[goodwin_obs] $Message"
+    Add-LogFileLine $line
+    Add-ActivityItem $Message
+    try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+}
+
+# Технический лог — пишется в файл и консоль PowerShell, не в основной GUI.
+# Используется внутри install/setup функций, чтобы не засорять интерфейс.
+function Write-Log {
+    param([string] $Message)
+    $ts = Get-Date -Format 'HH:mm:ss'
+    $line = "[$ts] $Message"
+    Write-Host $line
+    Add-LogFileLine $line
+}
+
+# Подробный отчёт об ошибке пишется в файл и консоль. В интерфейсе остаётся
+# короткая понятная строка, полный блок доступен через кнопку «Логи».
+function Write-ErrorDetails {
+    param(
+        [string] $Context,
+        $ErrorRecord
+    )
+    if (-not $ErrorRecord) { return }
+
+    $ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('═══ ОШИБКА — скопируйте этот блок ═══')
+    if ($Context) { [void]$sb.AppendLine("Этап:    $Context") }
+    if ($ex) {
+        [void]$sb.AppendLine("Тип:     $($ex.GetType().FullName)")
+        [void]$sb.AppendLine("Сообщ.:  $($ex.Message)")
+        if ($ex.HResult)    { [void]$sb.AppendLine("HResult: 0x$($ex.HResult.ToString('X8'))") }
+    }
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+        $inv = $ErrorRecord.InvocationInfo
+        if ($inv) {
+            if ($inv.ScriptName)        { [void]$sb.AppendLine("Скрипт:  $($inv.ScriptName):$($inv.ScriptLineNumber)") }
+            elseif ($inv.ScriptLineNumber) { [void]$sb.AppendLine("Строка:  $($inv.ScriptLineNumber)") }
+            if ($inv.Line)              { [void]$sb.AppendLine("Код:     $($inv.Line.Trim())") }
+            if ($inv.PositionMessage)   { [void]$sb.AppendLine($inv.PositionMessage) }
+        }
+        if ($ErrorRecord.CategoryInfo)   { [void]$sb.AppendLine("Кат.:    $($ErrorRecord.CategoryInfo)") }
+    }
+    # Inner exception chain
+    $inner = if ($ex) { $ex.InnerException } else { $null }
+    $depth = 0
+    while ($inner -and $depth -lt 5) {
+        [void]$sb.AppendLine("Внутр.($depth): $($inner.GetType().FullName): $($inner.Message)")
+        $inner = $inner.InnerException
+        $depth++
+    }
+    # Stack trace (truncate to first 12 lines for readability; full goes to console)
+    if ($ex -and $ex.StackTrace) {
+        $lines = $ex.StackTrace -split "`r?`n" | Where-Object { $_ }
+        $shown = $lines | Select-Object -First 12
+        [void]$sb.AppendLine('Стек:')
+        foreach ($ln in $shown) { [void]$sb.AppendLine('  ' + $ln.Trim()) }
+        if ($lines.Count -gt 12) { [void]$sb.AppendLine("  …ещё $($lines.Count - 12) строк (см. файл логов)") }
+    }
+    [void]$sb.AppendLine('═══════════════════════════════════════')
+    $text = $sb.ToString().TrimEnd()
+
+    Add-LogFileLine ''
+    Add-LogFileLine $text
+    if ($ex -and $ex.StackTrace) { Add-LogFileLine $ex.StackTrace }
+    Add-LogFileLine ''
+
+    Write-Host ''
+    Write-Host $text -ForegroundColor Red
+    if ($ex -and $ex.StackTrace) { Write-Host $ex.StackTrace -ForegroundColor DarkGray }
+    Write-Host ''
+
+    Add-ActivityItem ("Ошибка: " + $(if ($Context) { $Context } else { $ex.Message }))
+}
+
+$script:LastMultiRenderTicks = 0
+
+function Update-MultiProgressRender {
+    # Обновляет агрегированный прогресс загрузки в нижней строке состояния.
+    param([switch] $Force)
+    if (-not $script:MultiProgressState -or $script:MultiProgressState.Count -eq 0) { return }
+
+    if (-not $Force) {
+        if ($null -eq $script:LastMultiRenderTicks) { $script:LastMultiRenderTicks = 0 }
+        if (([Environment]::TickCount - $script:LastMultiRenderTicks) -lt 140) { return }
+    }
+    $script:LastMultiRenderTicks = [Environment]::TickCount
+
+    $totalAll = 0L
+    $upAll    = 0L
+    $doneCnt  = 0
+    $errorCnt = 0
+    $rows = New-Object System.Collections.Generic.List[string]
+
+    foreach ($name in $script:MultiProgressState.Keys) {
+        $st = $script:MultiProgressState[$name]
+        $u = [long]$st.Uploaded
+        $t = [long]$st.Total
+        $totalAll += $t
+        $upAll    += $u
+        if ($st.Status -eq 'done')  { $doneCnt++ }
+        if ($st.Status -eq 'error') { $doneCnt++; $errorCnt++ }
+
+        $pct = if ($t -gt 0) { [math]::Min(100, [math]::Floor($u * 100.0 / $t)) } else { 0 }
+        $tag = switch ($st.Status) {
+            'done'  { 'Готово' }
+            'error' { 'Ошибка' }
+            default { 'Загрузка' }
+        }
+        $rows.Add(("{0}%  {1}  {2}" -f $pct, $tag, $name))
+    }
+
+    $aggPct = if ($totalAll -gt 0) { [math]::Min(100, [math]::Floor($upAll * 100.0 / $totalAll)) } else { 0 }
+    $uploadedGb = [math]::Round($upAll / 1GB, 2)
+    $totalGb = [math]::Round($totalAll / 1GB, 2)
+    $detail = "Файлы: $doneCnt/$($script:MultiProgressState.Count), объём: $uploadedGb/$totalGb ГБ"
+    if ($errorCnt -gt 0) { $detail += ", ошибок: $errorCnt" }
+
+    if ($script:StatusLabel_ref) {
+        $script:StatusLabel_ref.Text = "НЕ ЗАКРЫВАЙТЕ ОКНО. Загрузка ($doneCnt/$($script:MultiProgressState.Count)): $aggPct%"
+    }
+    Set-UploadProgressUi -Percent $aggPct -Title 'Идёт загрузка записей' -Detail $detail -Rows $rows.ToArray()
+}
+
+function Show-UploadProgress {
+    # Совместимость со старым API: одиночный файл — это просто словарь из одного элемента
+    param([string] $FileName, [long] $Uploaded, [long] $Total, [string] $Status = 'active')
+    if (-not $script:MultiProgressState) {
+        Initialize-MultiProgress -Names @($FileName)
+    }
+    if ($script:MultiProgressState.Contains($FileName)) {
+        $script:MultiProgressState[$FileName].Uploaded = $Uploaded
+        $script:MultiProgressState[$FileName].Total    = $Total
+        $script:MultiProgressState[$FileName].Status   = $Status
+    } else {
+        $script:MultiProgressState[$FileName] = @{ Uploaded = $Uploaded; Total = $Total; Status = $Status }
+    }
+    # Финальные состояния файла рисуем сразу (минуя троттлинг), активные — троттлятся.
+    if ($Status -eq 'done' -or $Status -eq 'error') {
+        Update-MultiProgressRender -Force
+    } else {
+        Update-MultiProgressRender
+    }
+}
+
+function Ensure-Tls12 {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+function Invoke-Download {
+    param(
+        [Parameter(Mandatory = $true)][string] $Uri,
+        [Parameter(Mandatory = $true)][string] $OutFile
+    )
+
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $wc = $null
+        try {
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add('User-Agent', 'goodwin_obs-portable-installer')
+            $lastProgressTick = 0
+            $lastProgressPct = -1
+            $wc.add_DownloadProgressChanged({
+                param($sender, $eventArgs)
+                try {
+                    $pct = [int]$eventArgs.ProgressPercentage
+                    $nowTick = [Environment]::TickCount
+                    if ($pct -eq $lastProgressPct -and (($nowTick - $lastProgressTick) -lt 300)) { return }
+                    $lastProgressTick = $nowTick
+                    $lastProgressPct = $pct
+
+                    $receivedMb = [math]::Round([double]$eventArgs.BytesReceived / 1MB, 1)
+                    if ($eventArgs.TotalBytesToReceive -gt 0) {
+                        $totalMb = [math]::Round([double]$eventArgs.TotalBytesToReceive / 1MB, 1)
+                        Set-Status ("Скачиваем OBS Studio: {0}% ({1} / {2} МБ)" -f $pct, $receivedMb, $totalMb) 'Yellow'
+                    } else {
+                        Set-Status ("Скачиваем OBS Studio: {0} МБ" -f $receivedMb) 'Yellow'
+                    }
+                }
+                catch {}
+            })
+
+            $task = $wc.DownloadFileTaskAsync($Uri, $OutFile)
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $timeoutSec = 1200   # 20 минут на попытку — страховка от зависшего соединения без RST
+            while (-not $task.IsCompleted) {
+                try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+                Start-Sleep -Milliseconds 100
+                if ($sw.Elapsed.TotalSeconds -gt $timeoutSec) {
+                    try { $wc.CancelAsync() } catch {}
+                    throw "Таймаут скачивания ($timeoutSec с) — соединение зависло."
+                }
+            }
+            if ($task.IsFaulted) { throw $task.Exception.InnerException }
+            Set-Status 'Установка OBS...' 'Yellow'
+            return
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) { throw }
+            $delay = [math]::Min(30, [math]::Pow(2, $attempt))
+            Write-Log "Ошибка скачивания (попытка $attempt/$maxAttempts): $($_.Exception.Message). Повтор через $delay с."
+            Start-Sleep -Seconds $delay
+        }
+        finally {
+            if ($wc) { $wc.Dispose() }
+        }
+    }
+}
+
+
+function Get-LatestObsZipUrl {
+    Write-Log 'Ищем последнюю версию OBS Studio...'
+    $headers = @{ 'User-Agent' = 'goodwin_obs-portable-installer' }
+    $release = Invoke-RestMethod -Uri $ObsApiUrl -Headers $headers
+
+    $asset = $release.assets |
+        Where-Object { $_.name -match '^OBS-Studio-.+-Windows-x64\.zip$' -and $_.name -notmatch 'PDB' } |
+        Select-Object -First 1
+
+    if (-not $asset) {
+        throw 'Не удалось найти OBS Studio x64 ZIP в последнем релизе.'
+    }
+
+    Write-Log ("Найден файл: {0}" -f $asset.name)
+    return $asset.browser_download_url
+}
+
+function Get-SteamLibraryPaths {
+    $paths = @()
+    try {
+        $steamBase = (Get-ItemProperty -Path 'HKCU:\SOFTWARE\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+        if ($steamBase -and (Test-Path $steamBase)) {
+            $paths += $steamBase
+            # Parse libraryfolders.vdf for additional library roots
+            $vdf = Join-Path $steamBase 'steamapps\libraryfolders.vdf'
+            if (Test-Path $vdf) {
+                Get-Content $vdf | ForEach-Object {
+                    if ($_ -match '"path"\s+"(.+?)"') {
+                        $p = $Matches[1] -replace '\\\\', '\'
+                        if (Test-Path $p) { $paths += $p }
+                    }
+                }
+            }
+        }
+    } catch {}
+    return $paths
+}
+
+function Get-InstalledObsDir {
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'obs-studio'),
+        (Join-Path ${env:ProgramFiles(x86)} 'obs-studio')
+    )
+
+    # Steam OBS locations
+    foreach ($lib in (Get-SteamLibraryPaths)) {
+        $candidates += Join-Path $lib 'steamapps\common\OBS Studio'
+    }
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $candidateExe = Join-Path $candidate 'bin\64bit\obs64.exe'
+        if (Test-Path $candidateExe) {
+            Write-Log "Найден OBS: $candidate"
+            return $candidate
+        }
+    }
+
+    $registryPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio'
+    )
+
+    foreach ($registryPath in $registryPaths) {
+        if (-not (Test-Path $registryPath)) { continue }
+        $installLocation = (Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue).InstallLocation
+        if ([string]::IsNullOrWhiteSpace($installLocation)) { continue }
+        $candidateExe = Join-Path $installLocation 'bin\64bit\obs64.exe'
+        if (Test-Path $candidateExe) {
+            Write-Log "Найден OBS (реестр): $installLocation"
+            return $installLocation
+        }
+    }
+
+    return $null
+}
+
+function Install-ObsPortable {
+    param([switch]$ForceDownload)
+    Write-Step 'Устанавливаем OBS Studio'
+    $obsExe = Join-Path $InstallDir 'bin\64bit\obs64.exe'
+    if (Test-Path $obsExe) {
+        Write-Log "OBS уже установлен: $InstallDir"
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+    $installedObsDir = Get-InstalledObsDir
+    if ($installedObsDir -and -not $ForceDownload) {
+        $candidateExe = Join-Path $installedObsDir 'bin\64bit\obs64.exe'
+        try {
+            $ver = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($candidateExe).ProductVersion
+            Write-Log "Найден установленный OBS версии $ver"
+            # Требуем минимум 32.0
+            $verNum = [version]($ver.Split(' ')[0])
+            if ($verNum -lt [version]'32.0') {
+                Write-Log "Версия OBS слишком старая ($ver), будет скачана новая."
+                $installedObsDir = $null
+            }
+        } catch {}
+    }
+    if (-not [string]::IsNullOrWhiteSpace($installedObsDir) -and -not $ForceDownload) {
+        Write-Log "Копируем OBS из $installedObsDir в $InstallDir"
+        Copy-Item -Path (Join-Path $installedObsDir '*') -Destination $InstallDir -Recurse -Force
+
+        if (-not (Test-Path $obsExe)) {
+            throw "Файл OBS не найден после копирования: $obsExe"
+        }
+
+        return
+    }
+
+    $obsZipUrl = Get-LatestObsZipUrl
+    $obsZip = Join-Path $TempRoot 'obs.zip'
+
+    if ($script:StatusLabel_ref) { Set-Status 'Скачиваем OBS Studio — это может занять несколько минут...' 'Yellow' }
+    Write-Log 'Скачиваем OBS Studio...'
+    Invoke-Download -Uri $obsZipUrl -OutFile $obsZip
+
+    Write-Log "Распаковываем OBS в $InstallDir"
+    Expand-Archive -Path $obsZip -DestinationPath $InstallDir -Force
+
+    if (-not (Test-Path $obsExe)) {
+        throw "Файл OBS не найден после распаковки: $obsExe"
+    }
+
+    # Проверка целостности: официальные сборки OBS подписаны Authenticode.
+    # Невалидная подпись — повод насторожиться (подмена на зеркале / MITM).
+    # Не прерываем установку жёстко, но явно предупреждаем.
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $obsExe
+        if ($sig.Status -eq 'Valid') {
+            Write-Log "Подпись obs64.exe подтверждена: $($sig.SignerCertificate.Subject)"
+        } else {
+            Write-Log "⚠ Подпись obs64.exe НЕ подтверждена (Status=$($sig.Status)) — возможна подмена дистрибутива."
+            if ($script:StatusLabel_ref) { Set-Status '⚠ Подпись OBS не подтверждена — будьте внимательны' 'Yellow' }
+        }
+    }
+    catch {
+        Write-Log "Не удалось проверить подпись obs64.exe: $($_.Exception.Message)"
+    }
+}
+
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Write-TextFileAtomic {
+    # Атомарная запись текста БЕЗ BOM: пишем во временный файл и заменяем целевой,
+    # чтобы аварийная остановка в момент записи не оставила усечённый/битый файл.
+    # BOM критичен: с ним OBS не распознаёт первую секцию basic.ini/user.ini.
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Content
+    )
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+    $tmp = "$Path.tmp"
+    [IO.File]::WriteAllText($tmp, $Content, $script:Utf8NoBom)
+    if (Test-Path -LiteralPath $Path) {
+        # ВАЖНО: в PowerShell 5.1 / .NET Framework File.Replace с backup-аргументом
+        # $null бросает "The path is not of a legal form". Поэтому передаём временный
+        # backup-файл и тут же его удаляем. На случай иных сбоев — фолбэк копированием.
+        $bak = "$Path.bak"
+        try {
+            [IO.File]::Replace($tmp, $Path, $bak)
+        }
+        catch {
+            [IO.File]::Copy($tmp, $Path, $true)
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+        finally {
+            if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+        }
+    } else {
+        [IO.File]::Move($tmp, $Path)
+    }
+}
+
+function Write-BytesFileAtomic {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][byte[]] $Bytes
+    )
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+    $tmp = "$Path.tmp"
+    [IO.File]::WriteAllBytes($tmp, $Bytes)
+    if (Test-Path -LiteralPath $Path) {
+        $bak = "$Path.bak"
+        try {
+            [IO.File]::Replace($tmp, $Path, $bak)
+        }
+        catch {
+            [IO.File]::Copy($tmp, $Path, $true)
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+        finally {
+            if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+        }
+    } else {
+        [IO.File]::Move($tmp, $Path)
+    }
+}
+
+function Write-LinesFileAtomic {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string[]] $Lines
+    )
+    Write-TextFileAtomic -Path $Path -Content (($Lines -join "`r`n") + "`r`n")
+}
+
+function Install-BundledObsSceneCollection {
+    param([Parameter(Mandatory = $true)][string] $ConfigDir)
+
+    try {
+        $null = $script:BundledObsSceneCollectionJson | ConvertFrom-Json
+    }
+    catch {
+        throw "Встроенный goodwin_obs.json повреждён: $($_.Exception.Message)"
+    }
+
+    $sceneDir = Join-Path $ConfigDir 'basic\scenes'
+    $scenePath = Join-Path $sceneDir $script:BundledObsSceneCollectionFile
+    New-Item -ItemType Directory -Force -Path $sceneDir | Out-Null
+    Write-TextFileAtomic -Path $scenePath -Content ($script:BundledObsSceneCollectionJson.Trim() + "`r`n")
+    Write-Log "Настройки OBS сцены записаны локально: $scenePath"
+}
+
+function Install-BundledObsProfiles {
+    param([Parameter(Mandatory = $true)][string] $ConfigDir)
+
+    $profileRoot = Join-Path $ConfigDir 'basic\profiles'
+    New-Item -ItemType Directory -Force -Path $profileRoot | Out-Null
+
+    $zipBytes = [Convert]::FromBase64String(($script:BundledObsProfilesZipBase64 -replace '\s', ''))
+    $stream = New-Object IO.MemoryStream -ArgumentList (,$zipBytes)
+    $archive = $null
+    $count = 0
+    try {
+        $archive = New-Object IO.Compression.ZipArchive -ArgumentList $stream, ([IO.Compression.ZipArchiveMode]::Read)
+        $profileRootFull = [IO.Path]::GetFullPath($profileRoot).TrimEnd('\') + '\'
+
+        foreach ($entry in $archive.Entries) {
+            if ([string]::IsNullOrWhiteSpace($entry.FullName) -or $entry.FullName.EndsWith('/')) {
+                continue
+            }
+
+            $relativePath = $entry.FullName.Replace('/', '\')
+            if ([IO.Path]::IsPathRooted($relativePath) -or $relativePath -match '(^|\\)\.\.(\\|$)') {
+                throw "Недопустимый путь во встроенных профилях OBS: $($entry.FullName)"
+            }
+
+            $targetPath = Join-Path $profileRoot $relativePath
+            $targetFull = [IO.Path]::GetFullPath($targetPath)
+            if (-not $targetFull.StartsWith($profileRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Недопустимый путь во встроенных профилях OBS: $($entry.FullName)"
+            }
+
+            $entryStream = $entry.Open()
+            $entryBytes = New-Object IO.MemoryStream
+            try {
+                $entryStream.CopyTo($entryBytes)
+                Write-BytesFileAtomic -Path $targetFull -Bytes $entryBytes.ToArray()
+                $count++
+            }
+            finally {
+                $entryStream.Dispose()
+                $entryBytes.Dispose()
+            }
+        }
+    }
+    catch {
+        throw "Не удалось применить встроенные профили OBS: $($_.Exception.Message)"
+    }
+    finally {
+        if ($archive) { $archive.Dispose() }
+        $stream.Dispose()
+    }
+
+    if ($count -le 0) {
+        throw 'Встроенные профили OBS пустые'
+    }
+    Write-Log "Профили OBS записаны локально: $profileRoot ($count файлов)"
+}
+
+function Set-IniValue {
+    param(
+        [AllowEmptyString()][string[]] $Lines,
+        [Parameter(Mandatory = $true)][string] $Section,
+        [Parameter(Mandatory = $true)][string] $Key,
+        [Parameter(Mandatory = $true)][string] $Value
+    )
+
+    $sectionHeader = "[$Section]"
+    $sectionIndex = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i].Trim() -eq $sectionHeader) {
+            $sectionIndex = $i
+            break
+        }
+    }
+
+    if ($sectionIndex -lt 0) {
+        return @($Lines + '' + $sectionHeader + "$Key=$Value")
+    }
+
+    $escapedKey = [regex]::Escape($Key)
+    $insertIndex = $Lines.Count
+    for ($i = $sectionIndex + 1; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -match '^\s*\[.+\]\s*$') {
+            $insertIndex = $i
+            break
+        }
+
+        if ($Lines[$i] -match "^\s*$escapedKey\s*=") {
+            $Lines[$i] = "$Key=$Value"
+            return $Lines
+        }
+    }
+
+    if ($insertIndex -ge $Lines.Count) {
+        return @($Lines + "$Key=$Value")
+    }
+
+    return @($Lines[0..($insertIndex - 1)] + "$Key=$Value" + $Lines[$insertIndex..($Lines.Count - 1)])
+}
+
+function Get-JsonStringProperty {
+    param(
+        [object] $Object,
+        [string] $Name
+    )
+
+    if (-not $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if (-not $property) {
+        return $null
+    }
+
+    $value = $property.Value
+    if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+        return $value
+    }
+
+    return $null
+}
+
+function Set-JsonProperty {
+    param(
+        [Parameter(Mandatory = $true)][object] $Object,
+        [Parameter(Mandatory = $true)][string] $Name,
+        [object] $Value
+    )
+
+    if (-not $Object) {
+        return
+    }
+
+    if ($Object.PSObject.Properties[$Name]) {
+        $Object.$Name = $Value
+    } else {
+        $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
+    }
+}
+
+function Find-ObsSource {
+    param(
+        [object] $Object,
+        [string] $SourceId
+    )
+
+    $found = @()
+    if (-not $Object) {
+        return $found
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        foreach ($item in $Object) {
+            $found += Find-ObsSource -Object $item -SourceId $SourceId
+        }
+        return $found
+    }
+
+    $id = Get-JsonStringProperty -Object $Object -Name 'id'
+    if ($id -eq $SourceId) {
+        $found += $Object
+    }
+
+    foreach ($property in $Object.PSObject.Properties) {
+        $value = $property.Value
+        if ($value -and $value -isnot [string]) {
+            $found += Find-ObsSource -Object $value -SourceId $SourceId
+        }
+    }
+
+    return $found
+}
+
+function Get-WindowsCameraName {
+    # Exclude virtual/software cameras (OBS Virtual Camera, ManyCam, etc.)
+    $virtualCameraPattern = 'virtual|obs|manycam|splitcam|droidcam|epoccam|iriun|mmhmm|snap camera'
+
+    # 1. DirectShow registry — most reliable source of capture device names
+    try {
+        $dsPath = 'HKLM:\SOFTWARE\Classes\CLSID\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\Instance'
+        if (Test-Path $dsPath) {
+            $dsDevices = Get-ChildItem $dsPath -ErrorAction Stop |
+                ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).FriendlyName } |
+                Where-Object { $_ -and $_ -notmatch $virtualCameraPattern }
+            $dsDevice = $dsDevices | Select-Object -First 1
+            if ($dsDevice) {
+                return $dsDevice
+            }
+        }
+    }
+    catch { }
+
+    # 2. WMI PnP — works even when DirectShow registry is missing
+    try {
+        $devices = Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
+            Where-Object {
+                ($_.PNPClass -match '^(Camera|Image)$' -or $_.Service -match 'usbvideo') -and
+                $_.Name -and
+                $_.Name -notmatch 'microphone|audio' -and
+                $_.Name -notmatch $virtualCameraPattern
+            }
+        $device = $devices | Select-Object -First 1
+        if ($device) {
+            return $device.Name
+        }
+    }
+    catch { }
+
+    # 3. Get-PnpDevice — last resort
+    try {
+        $device = Get-PnpDevice -Class Camera -Status OK -ErrorAction Stop |
+            Where-Object { $_.FriendlyName -notmatch $virtualCameraPattern } |
+            Select-Object -First 1
+        if ($device -and $device.FriendlyName) {
+            return $device.FriendlyName
+        }
+    }
+    catch { }
+
+    return $null
+}
+
+function Get-MicrophoneDeviceMap {
+    # Возвращает [ordered] @{ FriendlyName = MMDeviceId } для активных capture-устройств,
+    # читая имя ровно так же, как это делает OBS: через WASAPI (IMMDeviceEnumerator +
+    # IPropertyStore::PKEY_Device_FriendlyName). Это даёт "Микрофон (FIFINE K670 Microphone)"
+    # вместо общего "Микрофон", который лежит в кешированном реестре.
+    $map = [ordered]@{}
+    try {
+        $entries = [GoodwinCoreAudio.AudioMeter]::EnumerateCaptureDevices()
+        foreach ($line in $entries) {
+            if (-not $line) { continue }
+            $sep = $line.LastIndexOf('|')
+            if ($sep -lt 0) { continue }
+            $name = $line.Substring(0, $sep)
+            $id   = $line.Substring($sep + 1)
+            if (-not $name -or -not $id) { continue }
+            $key = $name
+            $i = 2
+            while ($map.Contains($key)) { $key = "$name #$i"; $i++ }
+            $map[$key] = $id
+        }
+    } catch {
+        Write-Log "Перечисление микрофонов не удалось: $($_.Exception.Message)"
+    }
+    return $map
+}
+
+function Get-MicrophoneDeviceIdByName {
+    param([string]$FriendlyName)
+    if ([string]::IsNullOrWhiteSpace($FriendlyName)) { return 'default' }
+    $map = Get-MicrophoneDeviceMap
+    if ($map.Contains($FriendlyName)) { return $map[$FriendlyName] }
+    $hit = $map.Keys | Where-Object { $_ -like "*$FriendlyName*" } | Select-Object -First 1
+    if ($hit) { return $map[$hit] }
+    return 'default'
+}
+
+function Get-DefaultMicrophoneDeviceId {
+    try {
+        $regPath = 'HKCU:\SOFTWARE\Microsoft\Multimedia\Sound\LastUsedSoundDevice\Capture'
+        if (Test-Path $regPath) {
+            $deviceId = (Get-ItemProperty $regPath -ErrorAction SilentlyContinue).DeviceId
+            if ($deviceId) { return $deviceId }
+        }
+    } catch {}
+    return 'default'
+}
+
+function Set-ObsDeviceSettings {
+    Write-Step 'Применяем настройки микрофона и камеры'
+    $sceneFiles = Get-ChildItem -Path (Join-Path $InstallDir 'config\obs-studio\basic\scenes') -Filter '*.json' -File -ErrorAction SilentlyContinue
+    if (-not $sceneFiles) {
+        Write-Log 'Файлы сцен OBS не найдены (настройка устройств пропущена)'
+        return
+    }
+
+    # --- Микрофон ---
+    $micFriendly = $null
+    if ($script:SelectedMic) { $micFriendly = $script:SelectedMic }
+
+    $micDeviceId = $null
+    if ($micFriendly) {
+        $micDeviceId = Get-MicrophoneDeviceIdByName $micFriendly
+    } else {
+        $micDeviceId = Get-DefaultMicrophoneDeviceId
+    }
+
+    # --- Камера ---
+    $cameraSettings = $null
+    $cameraName = $null
+    if ($script:SelectedCamera) {
+        $cameraName = $script:SelectedCamera
+    } else {
+        $cameraName = Get-WindowsCameraName
+    }
+    if ($cameraName) {
+        $cameraSettings = [pscustomobject]@{ video_device_id = $cameraName }
+    }
+
+    foreach ($sceneFile in $sceneFiles) {
+        try {
+            $json = Get-Content -Raw -Path $sceneFile.FullName | ConvertFrom-Json
+        } catch {
+            Write-Log "Пропускаем повреждённый файл сцены: $($sceneFile.Name)"
+            continue
+        }
+
+        $changed = $false
+
+        # wasapi_input_capture
+        $micSources = @()
+        foreach ($property in $json.PSObject.Properties) {
+            if ($property.Value -and (Get-JsonStringProperty -Object $property.Value -Name 'id') -eq 'wasapi_input_capture') {
+                $micSources += $property.Value
+            }
+        }
+        $micSources += Find-ObsSource -Object $json.sources -SourceId 'wasapi_input_capture'
+
+        foreach ($micSource in $micSources) {
+            if (-not $micSource.settings) {
+                $micSource | Add-Member -MemberType NoteProperty -Name 'settings' -Value ([pscustomobject]@{})
+            }
+            if ($micSource.settings.PSObject.Properties['device_id']) {
+                $micSource.settings.device_id = $micDeviceId
+            } else {
+                $micSource.settings | Add-Member -MemberType NoteProperty -Name 'device_id' -Value $micDeviceId
+            }
+            $changed = $true
+        }
+
+        # dshow_input
+        if ($cameraSettings) {
+            $cameraSources = Find-ObsSource -Object $json.sources -SourceId 'dshow_input'
+            foreach ($cameraSource in $cameraSources) {
+                $cameraSource.settings = $cameraSettings
+                # Глушим звук камеры: она захватывает аудио-пин устройства и роутит его
+                # во все дорожки записи. muted=true + mixers=0 убирают её со всех дорожек.
+                Set-JsonProperty -Object $cameraSource -Name 'muted'  -Value $true
+                Set-JsonProperty -Object $cameraSource -Name 'mixers' -Value 0
+                $changed = $true
+            }
+        }
+
+        if ($changed) {
+            Write-TextFileAtomic -Path $sceneFile.FullName -Content ($json | ConvertTo-Json -Depth 100)
+        }
+    }
+
+    # --- Прошиваем глобальные аудио-устройства в профилях ---
+    $profileRoot = Join-Path $InstallDir 'config\obs-studio\basic\profiles'
+    if (Test-Path $profileRoot) {
+        Get-ChildItem -Path $profileRoot -Directory | ForEach-Object {
+            $basicIni = Join-Path $_.FullName 'basic.ini'
+            if (Test-Path $basicIni) {
+                $lines = @(Get-Content -Path $basicIni)
+                $lines = Set-IniValue -Lines $lines -Section 'Audio' -Key 'MicDeviceId' -Value $micDeviceId
+                if ($micFriendly) {
+                    $lines = Set-IniValue -Lines $lines -Section 'Audio' -Key 'MicDevice' -Value $micFriendly
+                }
+                Write-LinesFileAtomic -Path $basicIni -Lines $lines
+            }
+        }
+    }
+
+    if ($cameraSettings) {
+        Write-Log "Камера настроена: $cameraName"
+    } else {
+        Write-Log 'Камера не обнаружена — используются настройки из пакета'
+    }
+
+    $micLog = 'default'
+    if ($micFriendly) { $micLog = $micFriendly }
+    Write-Log "Микрофон настроен: $micLog [$micDeviceId]"
+}
+
+function Set-SceneItemTransform {
+    param(
+        [Parameter(Mandatory = $true)][object] $Item,
+        [Parameter(Mandatory = $true)][double] $X,
+        [Parameter(Mandatory = $true)][double] $Y,
+        [Parameter(Mandatory = $true)][double] $Width,
+        [Parameter(Mandatory = $true)][double] $Height,
+        # 1 = STRETCH (заполнить bounds игнорируя AR), 2 = SCALE_INNER (вписать с сохранением AR)
+        [int] $BoundsType = 1
+    )
+
+    $Item.pos = [pscustomobject]@{ x = $X; y = $Y }
+    $Item.scale = [pscustomobject]@{ x = 1.0; y = 1.0 }
+    $Item.align = 5
+    $Item.bounds_type = $BoundsType
+    $Item.bounds_align = 5
+    $Item.bounds_crop = $false
+    $Item.bounds = [pscustomobject]@{ x = $Width; y = $Height }
+    $Item.crop_left = 0
+    $Item.crop_top = 0
+    $Item.crop_right = 0
+    $Item.crop_bottom = 0
+}
+
+function Set-ObsSceneLayout {
+    Write-Step 'Проверяем разрешение сцены'
+    $sceneFiles = Get-ChildItem -Path (Join-Path $InstallDir 'config\obs-studio\basic\scenes') -Filter '*.json' -File -ErrorAction SilentlyContinue
+    if (-not $sceneFiles) {
+        Write-Log 'Файлы сцен OBS не найдены (настройка размещения пропущена)'
+        return
+    }
+
+    foreach ($sceneFile in $sceneFiles) {
+        try {
+            $json = Get-Content -Raw -Path $sceneFile.FullName | ConvertFrom-Json
+        }
+        catch {
+            Write-Log "Пропускаем повреждённый файл сцены: $($sceneFile.Name)"
+            continue
+        }
+
+        $changed = $false
+        if ($json.PSObject.Properties['resolution']) {
+            if ($json.resolution.x -ne 1920 -or $json.resolution.y -ne 1080) {
+                $json.resolution.x = 1920
+                $json.resolution.y = 1080
+                $changed = $true
+            }
+        }
+        else {
+            $json | Add-Member -MemberType NoteProperty -Name 'resolution' -Value ([pscustomobject]@{ x = 1920; y = 1080 })
+            $changed = $true
+        }
+
+        if ($changed) {
+            Write-TextFileAtomic -Path $sceneFile.FullName -Content ($json | ConvertTo-Json -Depth 100)
+        }
+    }
+
+    Write-Log 'Размещение сцены берётся из встроенного goodwin_obs.json; автоматически фиксируется только resolution=1920x1080'
+}
+
+function Show-LowDiskSpaceWarning {
+    $downloadsPath = Join-Path $env:USERPROFILE 'Downloads'
+    try {
+        $driveRoot = [IO.Path]::GetPathRoot((Resolve-Path $downloadsPath))
+        $drive = Get-PSDrive -Name $driveRoot.TrimEnd(':\') -ErrorAction Stop
+        $freeGb = [math]::Round(($drive.Free / 1GB), 1)
+
+        if ($drive.Free -lt 30GB) {
+            Write-Step "Мало места на диске: свободно $freeGb ГБ, запись может быть короче 2 часов."
+
+            if ($script:StatusLabel_ref) {
+                Set-Status "⚠ Мало места на диске: $freeGb ГБ свободно" 'Red'
+            }
+        }
+    }
+    catch {
+        Write-Log 'Не удалось проверить свободное место на диске'
+    }
+}
+
+function Get-HardwareProfileName {
+    $gpuNames = @()
+    $logicalCpuCount = 0
+    $totalMemoryGb = 0
+
+    try {
+        $gpuNames = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object { $_.Name })
+    }
+    catch {
+        try {
+            $gpuNames = @(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Video\*\*\Video' -ErrorAction SilentlyContinue | ForEach-Object { $_.DriverDesc })
+        }
+        catch {
+            $gpuNames = @()
+        }
+    }
+
+    try {
+        $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        $logicalCpuCount = [int] $cpu.NumberOfLogicalProcessors
+    }
+    catch {
+        $logicalCpuCount = [int] $env:NUMBER_OF_PROCESSORS
+    }
+
+    try {
+        $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $totalMemoryGb = [math]::Round(([double] $computer.TotalPhysicalMemory / 1GB), 0)
+    }
+    catch {
+        $totalMemoryGb = 0
+    }
+
+    $gpuText = ($gpuNames -join ' ')
+    $vendor = 'cpu'
+    if ($gpuText -match 'NVIDIA|GeForce|RTX|GTX|Quadro') {
+        $vendor = 'nvidia'
+    }
+    elseif ($gpuText -match 'AMD|Radeon') {
+        $vendor = 'amd'
+    }
+
+    # Detect VRAM
+    $vramMb = 0
+    $gpuModel = ''
+    try {
+        $gpuObj = Get-CimInstance Win32_VideoController -ErrorAction Stop |
+            Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|GTX|Quadro|AMD|Radeon' } |
+            Select-Object -First 1
+        if ($gpuObj) {
+            $gpuModel = $gpuObj.Name
+            if ($gpuObj.AdapterRAM) {
+                $rawVramMb = [int] ($gpuObj.AdapterRAM / 1MB)
+                # Win32_VideoController.AdapterRAM — uint32 и не может показать > 4096 МБ.
+                # Около 4095 МБ значение недостоверно (переполнение для карт с 6/8/12+ ГБ),
+                # поэтому в этом случае оцениваем VRAM по модели (vramMap ниже).
+                if ($rawVramMb -gt 0 -and $rawVramMb -lt 4000) {
+                    $vramMb = $rawVramMb
+                } else {
+                    Write-Log "AdapterRAM=$rawVramMb МБ недостоверно (uint32), оцениваю VRAM по модели GPU"
+                }
+            }
+        }
+    }
+    catch { }
+
+    # Fallback VRAM estimation from model name if AdapterRAM is 0
+    if ($vramMb -le 0 -and $gpuModel) {
+        # Common modern cards
+        $vramMap = @{
+            '5090' = 32768; '5080' = 16384; '5070 Ti' = 16384; '5070' = 12288; '5060 Ti' = 16384; '5060' = 8192;
+            '4090' = 24576; '4080' = 16384; '4070 Ti' = 12288; '4070' = 12288; '4060 Ti' = 16384; '4060' = 8192;
+            '3090' = 24576; '3080' = 10240; '3070' = 8192; '3060' = 12288;
+            '7900 XTX' = 24576; '7900 XT' = 20480; '7800 XT' = 16384; '7700 XT' = 12288; '7600' = 8192;
+            '6950 XT' = 16384; '6900 XT' = 16384; '6800 XT' = 16384; '6700 XT' = 12288; '6600 XT' = 8192
+        }
+        foreach ($k in $vramMap.Keys) {
+            if ($gpuModel -match [regex]::Escape($k)) { $vramMb = $vramMap[$k]; break }
+        }
+    }
+
+    $tier = 'medium'
+
+    if ($vendor -eq 'nvidia') {
+        # High tier for RTX 40/50 series and high VRAM
+        $isHighSeries = $gpuModel -match 'RTX\s*(50|40)\d{2}'
+        $isMidHigh = $gpuModel -match 'RTX\s*30[789]0'
+        if ($isHighSeries -or $isMidHigh -or $vramMb -ge 12000 -or $totalMemoryGb -ge 32) {
+            $tier = 'high'
+        }
+        elseif ($vramMb -gt 0 -and $vramMb -lt 6000) {
+            $tier = 'low'
+        }
+        else {
+            $tier = 'medium'
+        }
+    }
+    elseif ($vendor -eq 'amd') {
+        $isHighSeries = $gpuModel -match 'RX\s*(7|6)\d{3}'
+        if ($isHighSeries -or $vramMb -ge 12000 -or $totalMemoryGb -ge 32) {
+            $tier = 'high'
+        }
+        elseif ($vramMb -gt 0 -and $vramMb -lt 6000) {
+            $tier = 'low'
+        }
+        else {
+            $tier = 'medium'
+        }
+    }
+    else {
+        # CPU encoding path
+        if ($logicalCpuCount -ge 12 -and $totalMemoryGb -ge 32) {
+            $tier = 'high'
+        }
+        elseif ($logicalCpuCount -ge 8 -and $totalMemoryGb -ge 16) {
+            $tier = 'medium'
+        }
+        else {
+            $tier = 'low'
+        }
+    }
+
+    Write-Log "Оборудование: vendor=$vendor, tier=$tier, gpu='$gpuModel', ядра=$logicalCpuCount, ОЗУ=${totalMemoryGb}ГБ, VRAM=${vramMb}МБ"
+    return "${vendor}_${tier}"
+}
+
+function Set-ActiveObsProfile {
+    Write-Step 'Определяем оборудование'
+    $configDir = Join-Path $InstallDir 'config\obs-studio'
+    $profileRoot = Join-Path $configDir 'basic\profiles'
+    $sceneRoot = Join-Path $configDir 'basic\scenes'
+
+    $profileName = Get-HardwareProfileName
+    if (-not (Test-Path (Join-Path $profileRoot $profileName))) {
+        $profileName = 'cpu_medium'
+    }
+
+    $preferredScenePath = Join-Path $sceneRoot $script:BundledObsSceneCollectionFile
+    $sceneFile = if (Test-Path -LiteralPath $preferredScenePath) {
+        Get-Item -LiteralPath $preferredScenePath
+    } else {
+        Get-ChildItem -Path $sceneRoot -Filter '*.json' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    $sceneCollectionFile = if ($sceneFile) { $sceneFile.Name } else { 'goodwin_obs.json' }
+    $sceneCollectionName = [IO.Path]::GetFileNameWithoutExtension($sceneCollectionFile)
+
+    $userIni = Join-Path $configDir 'user.ini'
+    $lines = @()
+    if (Test-Path $userIni) {
+        $lines = @(Get-Content -Path $userIni)
+    }
+
+    $lines = Set-IniValue -Lines $lines -Section 'General' -Key 'FirstRun' -Value 'true'
+    $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'Profile' -Value $profileName
+    $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'ProfileDir' -Value $profileName
+    $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'SceneCollection' -Value $sceneCollectionName
+    $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'SceneCollectionFile' -Value $sceneCollectionFile
+    $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'ConfigOnNewProfile' -Value 'true'
+
+    Write-LinesFileAtomic -Path $userIni -Lines $lines
+    Write-Step "Установлен профиль: $profileName"
+}
+
+function Set-PortableObsConfig {
+    Write-Step 'Устанавливаем путь записи'
+    $profileRoot = Join-Path $InstallDir 'config\obs-studio\basic\profiles'
+    if (-not (Test-Path $profileRoot)) {
+        Write-Log 'Профили OBS не найдены'
+        return
+    }
+
+    $profiles = @(Get-ChildItem -Path $profileRoot -Directory)
+    if (-not $profiles) {
+        Write-Log 'Профили OBS не найдены'
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $script:RecordingDir | Out-Null
+
+    $recordingPath = $script:RecordingDir
+    $recordingPathForObs = $recordingPath.Replace('\', '\\')
+    $recordingResolution = '1920x1080'
+
+    Write-Log "Путь записей: $recordingPath"
+    Write-Log "Разрешение записи: $recordingResolution"
+
+    $nickname = $script:SelectedNickname
+    if ([string]::IsNullOrWhiteSpace($nickname)) { $nickname = 'untitled' }
+    $filenameFormat = "$nickname %CCYY-%MM-%DD %hh-%mm-%ss"
+    Write-Log "Формат имени файла установлен: $filenameFormat"
+
+    foreach ($profile in $profiles) {
+        $basicIni = Join-Path $profile.FullName 'basic.ini'
+        if (-not (Test-Path $basicIni)) {
+            continue
+        }
+
+        $lines = @(Get-Content -Path $basicIni)
+        $lines = Set-IniValue -Lines $lines -Section 'SimpleOutput' -Key 'FilePath' -Value $recordingPathForObs
+        $lines = Set-IniValue -Lines $lines -Section 'SimpleOutput' -Key 'VBitrate' -Value '15000'
+        $lines = Set-IniValue -Lines $lines -Section 'AdvOut' -Key 'RecFilePath' -Value $recordingPathForObs
+        $lines = Set-IniValue -Lines $lines -Section 'AdvOut' -Key 'FFFilePath' -Value $recordingPathForObs
+        $lines = Set-IniValue -Lines $lines -Section 'AdvOut' -Key 'FFVBitrate' -Value '15000'
+        $lines = Set-IniValue -Lines $lines -Section 'AdvOut' -Key 'RescaleRes' -Value $recordingResolution
+        $lines = Set-IniValue -Lines $lines -Section 'AdvOut' -Key 'RecRescaleRes' -Value $recordingResolution
+        $lines = Set-IniValue -Lines $lines -Section 'AdvOut' -Key 'FFRescaleRes' -Value $recordingResolution
+        $lines = Set-IniValue -Lines $lines -Section 'Video' -Key 'BaseCX' -Value '1920'
+        $lines = Set-IniValue -Lines $lines -Section 'Video' -Key 'BaseCY' -Value '1080'
+        $lines = Set-IniValue -Lines $lines -Section 'Video' -Key 'OutputCX' -Value '1920'
+        $lines = Set-IniValue -Lines $lines -Section 'Video' -Key 'OutputCY' -Value '1080'
+
+        $lines = Set-IniValue -Lines $lines -Section 'Output' -Key 'FilenameFormatting' -Value $filenameFormat
+
+        Write-LinesFileAtomic -Path $basicIni -Lines $lines
+
+        # Update bitrate in recordEncoder.json (used by AdvOut for h264/NVENC/AMD)
+        $encoderJson = Join-Path $profile.FullName 'recordEncoder.json'
+        if (Test-Path $encoderJson) {
+            try {
+                $enc = Get-Content -Raw -Path $encoderJson | ConvertFrom-Json
+                foreach ($key in @('bitrate', 'target_bitrate', 'VBitrate')) {
+                    if ($enc.PSObject.Properties[$key]) {
+                        $enc.$key = 15000
+                    }
+                }
+                Write-TextFileAtomic -Path $encoderJson -Content ($enc | ConvertTo-Json -Depth 100)
+            } catch {
+                Write-Log "Не удалось обновить recordEncoder.json: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    Set-ObsDeviceSettings
+    Set-ObsSceneLayout
+    Set-ActiveObsProfile
+    Show-LowDiskSpaceWarning
+}
+
+function Install-PortableSettings {
+    Write-Step 'Применяем базовые настройки'
+    $portableFlag = Join-Path $InstallDir 'portable_mode.txt'
+    $configDir = Join-Path $InstallDir 'config\obs-studio'
+
+    Write-Log 'Включаем портативный режим OBS'
+    New-Item -ItemType File -Force -Path $portableFlag | Out-Null
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+    Write-Log 'Применяем встроенные настройки OBS'
+    Install-BundledObsSceneCollection -ConfigDir $configDir
+    Install-BundledObsProfiles -ConfigDir $configDir
+
+    Set-PortableObsConfig
+}
+
+function Start-PortableObs {
+    $obsExe = Join-Path $InstallDir 'bin\64bit\obs64.exe'
+    $obsWorkDir = Split-Path $obsExe -Parent
+
+    Write-Step 'Запускаем OBS Studio'
+    Start-Process -FilePath $obsExe -ArgumentList '--multi --portable' -WorkingDirectory $obsWorkDir
+}
+
+
+# Доступ к Dropbox: refresh token обменивается на короткоживущий access token.
+# Для распространения скрипта безопаснее вынести этот обмен на серверный endpoint.
+
+function Get-WebExceptionDetail {
+    # Извлекает HTTP-статус и тело ответа из ошибки Invoke-RestMethod/Invoke-WebRequest.
+    # Работает и в Windows PowerShell 5.1 (поток ответа), и в PowerShell 7 (ErrorDetails).
+    # Дополнительно парсит JSON-ошибку OAuth/API: поле error
+    # и error_description.
+    param([Parameter(Mandatory = $true)] $ErrorRecord)
+
+    $result = [pscustomobject]@{
+        StatusCode = $null
+        Body       = $null
+        OAuthError = $null
+        OAuthDesc  = $null
+    }
+
+    $resp = $ErrorRecord.Exception.Response
+    if ($resp) {
+        try { $result.StatusCode = [int] $resp.StatusCode } catch {}
+    }
+
+    # PS 7 кладёт тело в ErrorDetails.Message; PS 5.1 — читаем поток ответа вручную.
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $result.Body = $ErrorRecord.ErrorDetails.Message
+    }
+    elseif ($resp -and $resp.PSObject.Methods['GetResponseStream']) {
+        try {
+            $stream = $resp.GetResponseStream()
+            $reader = New-Object IO.StreamReader($stream)
+            $result.Body = $reader.ReadToEnd()
+            $reader.Close()
+        } catch {}
+    }
+
+    if ($result.Body) {
+        try {
+            $json = $result.Body | ConvertFrom-Json
+            if ($json.error) {
+                if ($json.error -is [string]) { $result.OAuthError = $json.error }
+                elseif ($json.error.message)  { $result.OAuthError = $json.error.message }
+            }
+            if ($json.error_description) { $result.OAuthDesc = $json.error_description }
+        } catch {}
+    }
+
+    return $result
+}
+
+function Test-RetryableWebError {
+    # Повторять есть смысл только на временных сбоях: сетевые ошибки/таймауты,
+    # 408 (timeout), 429 (rate limit) и 5xx. 400/401/404 — постоянные ошибки клиента.
+    # 403 здесь НЕ повторяем: это либо квота/права (повтор бесполезен), либо суточный
+    # лимит выгрузки (userRateLimitExceeded) — его разруливает failover на другой
+    # аккаунт на уровне открытия сессии, а не слепой повтор того же запроса (который
+    # лишь сильнее жжёт суточный лимит).
+    param([Parameter(Mandatory = $true)] $ErrorRecord)
+
+    $resp = $ErrorRecord.Exception.Response
+    if (-not $resp) { return $true }  # нет ответа => сетевая ошибка/таймаут — повторяем
+
+    $code = 0
+    try { $code = [int] $resp.StatusCode } catch { return $true }
+    if ($code -le 0) { return $true }
+
+    if ($code -eq 408 -or $code -eq 429) { return $true }
+    if ($code -ge 500) { return $true }
+    return $false
+}
+
+function Invoke-UploadWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock] $Operation,
+        [int] $Retries = 5
+    )
+
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $Operation
+        }
+        catch {
+            $attempt++
+            # На постоянных ошибках клиента (например 400 от OAuth) не крутим повторы впустую.
+            if ($attempt -gt $Retries -or -not (Test-RetryableWebError $_)) {
+                throw
+            }
+
+            $delaySeconds = [math]::Min(30, [math]::Pow(2, $attempt))
+            Write-Step "Ошибка загрузки, повтор через $delaySeconds с. ($attempt/$Retries): $($_.Exception.Message)"
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
+# Кэш короткоживущего Dropbox access_token. Refresh token нужен только для
+# получения нового access token, поэтому чанк-загрузка не дёргает OAuth на каждый блок.
+$script:CachedAccessToken = $null
+$script:CachedAccessTokenExpiresAt = [datetime]::MinValue
+$script:DropboxUploadFolderPath = $DropboxUploadFolderPath
+$script:DropboxAccessState = 'Не проверен'
+
+function Get-GoodwinSecretKey {
+    $key = [Environment]::GetEnvironmentVariable('GOODWIN_OBS_KEY', 'Process')
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        throw 'Не задан ключ дешифровки GOODWIN_OBS_KEY. Укажите его в переменной окружения перед запуском скрипта.'
+    }
+    return $key
+}
+
+function Unprotect-GoodwinSecret {
+    param(
+        [Parameter(Mandatory = $true)][string] $Payload,
+        [Parameter(Mandatory = $true)][string] $Password
+    )
+
+    $parts = $Payload -split ':', 4
+    if ($parts.Count -ne 4 -or $parts[0] -ne 'v1') {
+        throw 'Некорректный формат зашифрованного значения.'
+    }
+
+    $salt = [Convert]::FromBase64String($parts[1])
+    $iv = [Convert]::FromBase64String($parts[2])
+    $cipher = [Convert]::FromBase64String($parts[3])
+    $kdf = $null
+    $aes = $null
+    $dec = $null
+    try {
+        $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($Password, $salt, 100000)
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256
+        $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = $kdf.GetBytes(32)
+        $aes.IV = $iv
+        $dec = $aes.CreateDecryptor()
+        $plain = $dec.TransformFinalBlock($cipher, 0, $cipher.Length)
+        return [Text.Encoding]::UTF8.GetString($plain)
+    }
+    catch {
+        throw 'Не удалось расшифровать Dropbox OAuth-конфиг. Проверьте ключ GOODWIN_OBS_KEY.'
+    }
+    finally {
+        if ($dec) { $dec.Dispose() }
+        if ($aes) { $aes.Dispose() }
+        if ($kdf) { $kdf.Dispose() }
+    }
+}
+
+function Get-DropboxOAuthConfig {
+    if ($script:DropboxOAuthConfig) { return $script:DropboxOAuthConfig }
+
+    $key = Get-GoodwinSecretKey
+    $script:DropboxOAuthConfig = [pscustomobject]@{
+        AppKey       = Unprotect-GoodwinSecret $script:DropboxOAuthEncrypted.k $key
+        AppSecret    = Unprotect-GoodwinSecret $script:DropboxOAuthEncrypted.s $key
+        RefreshToken = Unprotect-GoodwinSecret $script:DropboxOAuthEncrypted.r $key
+    }
+    return $script:DropboxOAuthConfig
+}
+
+function Ensure-DropboxRefreshToken {
+    if (-not [string]::IsNullOrWhiteSpace($script:DropboxRuntimeRefreshToken)) {
+        return $script:DropboxRuntimeRefreshToken
+    }
+
+    $cfg = Get-DropboxOAuthConfig
+    if ([string]::IsNullOrWhiteSpace($cfg.RefreshToken)) {
+        throw 'Dropbox refresh_token не задан в зашифрованном OAuth-конфиге.'
+    }
+
+    $script:DropboxRuntimeRefreshToken = [string]$cfg.RefreshToken
+    return $script:DropboxRuntimeRefreshToken
+}
+
+function Get-DropboxAccessToken {
+    [CmdletBinding()]
+    param([switch] $Force)
+
+    Ensure-Tls12
+
+    # Переиспользуем токен, пока до истечения > 5 минут; иначе спрашиваем сервер заново.
+    if (-not $Force -and $script:CachedAccessToken -and
+        ((Get-Date) -lt $script:CachedAccessTokenExpiresAt.AddMinutes(-5))) {
+        Set-DropboxAccessState 'Готов'
+        return $script:CachedAccessToken
+    }
+
+    Set-DropboxAccessState 'Проверка'
+    try {
+        $refreshToken = Ensure-DropboxRefreshToken
+    }
+    catch {
+        Set-DropboxAccessState 'Ошибка'
+        throw
+    }
+
+    $cfg = Get-DropboxOAuthConfig
+    $pair = '{0}:{1}' -f $cfg.AppKey, $cfg.AppSecret
+    $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+    try {
+        $response = Invoke-UploadWithRetry {
+            Invoke-RestMethod `
+                -Method Post `
+                -Uri 'https://api.dropboxapi.com/oauth2/token' `
+                -Headers @{ Authorization = "Basic $basic" } `
+                -Body @{
+                    grant_type = 'refresh_token'
+                    refresh_token = $refreshToken
+                } `
+                -TimeoutSec 30
+        }
+    }
+    catch {
+        $detail = Get-WebExceptionDetail $_
+        $statusText = if ($detail.StatusCode) { "HTTP $($detail.StatusCode)" } else { 'сетевая ошибка' }
+        Write-Log "Запрос Dropbox access token не удался ($statusText): $($_.Exception.Message)"
+        if ($detail.Body) { Write-Log "Тело ответа Dropbox OAuth: $($detail.Body)" }
+        Set-DropboxAccessState 'Ошибка'
+        throw "Не удалось получить Dropbox access token ($statusText). Проверьте ключ GOODWIN_OBS_KEY, OAuth-конфиг и права приложения."
+    }
+
+    if (-not $response.access_token) {
+        Set-DropboxAccessState 'Ошибка'
+        throw 'Dropbox OAuth не вернул access_token.'
+    }
+
+    $lifetime = if ($response.expires_in) { [int]$response.expires_in } else { 3600 }
+    $script:CachedAccessToken = $response.access_token
+    $script:CachedAccessTokenExpiresAt = (Get-Date).AddSeconds($lifetime)
+    Set-DropboxAccessState 'Готов'
+    return $script:CachedAccessToken
+}
+
+function ConvertTo-DropboxApiJson {
+    param([Parameter(Mandatory = $true)] $Object)
+    $json = ($Object | ConvertTo-Json -Depth 20 -Compress)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $json.ToCharArray()) {
+        $code = [int][char]$ch
+        if ($code -gt 127) {
+            [void]$sb.Append(('\u{0:x4}' -f $code))
+        } else {
+            [void]$sb.Append($ch)
+        }
+    }
+    return $sb.ToString()
+}
+
+function Ensure-DropboxUploadFolder {
+    param([Parameter(Mandatory = $true)][string] $AccessToken)
+
+    $path = $script:DropboxUploadFolderPath
+    if ([string]::IsNullOrWhiteSpace($path) -or $path -eq '/') { return }
+    if (-not $path.StartsWith('/')) { $path = '/' + $path }
+    $path = $path.TrimEnd('/')
+    $script:DropboxUploadFolderPath = $path
+
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    try {
+        Invoke-RestMethod `
+            -Method Post `
+            -Uri 'https://api.dropboxapi.com/2/files/create_folder_v2' `
+            -Headers $headers `
+            -ContentType 'application/json' `
+            -Body (ConvertTo-DropboxApiJson @{ path = $path; autorename = $false }) | Out-Null
+        Write-Log "Dropbox: создана папка $path"
+    }
+    catch {
+        $detail = Get-WebExceptionDetail $_
+        if ($detail.Body -and $detail.Body -match 'path/conflict/folder') {
+            Write-Log "Dropbox: папка уже существует $path"
+            return
+        }
+        if ($detail.Body) { Write-Log "Dropbox create_folder detail: $($detail.Body)" }
+        throw
+    }
+}
+
+function Set-DropboxAccessState {
+    param([string] $State)
+
+    $script:DropboxAccessState = $State
+    if ($script:DropboxStateLabel_ref) {
+        $script:DropboxStateLabel_ref.Text = $State
+        try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+    }
+}
+
+function Test-DropboxAccess {
+    # Дополнительная проверка: убеждаемся, что OAuth-токен живой и папка
+    # Dropbox для загрузки доступна на запись.
+    # Возвращает $true при успехе, $false иначе. Сама ошибка пишется в технический лог.
+    Set-DropboxAccessState 'Проверка'
+    try {
+        Ensure-Tls12
+        $accessToken = Get-DropboxAccessToken
+        Ensure-DropboxUploadFolder -AccessToken $accessToken
+        Write-Log "Dropbox API: папка '$($script:DropboxUploadFolderPath)' доступна для загрузки"
+        Set-DropboxAccessState 'Готов'
+        return $true
+    }
+    catch {
+        $detail = Get-WebExceptionDetail $_
+        Write-Log "Dropbox API check FAILED: $($_.Exception.Message)"
+        if ($detail.Body) { Write-Log "Detail: $($detail.Body)" }
+        Set-DropboxAccessState 'Ошибка'
+        return $false
+    }
+}
+
+function Get-VideoMimeType {
+    param([Parameter(Mandatory = $true)][string] $InputFile)
+
+    switch ([IO.Path]::GetExtension($InputFile).ToLowerInvariant()) {
+        '.mp4' { return 'video/mp4' }
+        '.mkv' { return 'video/x-matroska' }
+        '.mov' { return 'video/quicktime' }
+        '.flv' { return 'video/x-flv' }
+        default { return 'application/octet-stream' }
+    }
+}
+
+function Get-DropboxUploadPath {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo] $File)
+
+    $folder = $script:DropboxUploadFolderPath
+    if ([string]::IsNullOrWhiteSpace($folder) -or $folder -eq '/') {
+        return '/' + $File.Name
+    }
+    if (-not $folder.StartsWith('/')) { $folder = '/' + $folder }
+    $folder = $folder.TrimEnd('/')
+    return "$folder/$($File.Name)"
+}
+
+function New-DropboxUploadSession {
+    param(
+        [Parameter(Mandatory = $true)][string] $AccessToken,
+        [Parameter(Mandatory = $true)][string] $InputFile
+    )
+
+    $request = New-Object System.Net.Http.HttpRequestMessage -ArgumentList ([System.Net.Http.HttpMethod]::Post), 'https://content.dropboxapi.com/2/files/upload_session/start'
+    $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $AccessToken)
+    $request.Headers.TryAddWithoutValidation('Dropbox-API-Arg', (ConvertTo-DropboxApiJson @{ close = $false })) | Out-Null
+    $emptyBytes = New-Object byte[] 0
+    $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,$emptyBytes)
+    $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
+    $request.Content = $content
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds(60)
+    try {
+        $response = Wait-HttpTask ($client.SendAsync($request))
+        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            throw "Dropbox upload_session/start HTTP $([int]$response.StatusCode): $body"
+        }
+        $json = $body | ConvertFrom-Json
+        if (-not $json.session_id) {
+            throw 'Dropbox не вернул session_id для upload_session/start.'
+        }
+        return [string]$json.session_id
+    }
+    finally {
+        $request.Dispose()
+        $content.Dispose()
+        $client.Dispose()
+    }
+}
+
+function Wait-HttpTask {
+    # Ждём завершения HTTP-задачи, прокручивая очередь сообщений WinForms,
+    # чтобы окно не зависало («Не отвечает») во время отправки большого чанка.
+    param([Parameter(Mandatory = $true)] $Task)
+    while (-not $Task.IsCompleted) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 50
+    }
+    return $Task.GetAwaiter().GetResult()
+}
+
+function Get-DropboxErrorSummary {
+    # Достаёт короткую машинную причину ошибки Dropbox (error_summary).
+    param([string] $Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return $null }
+    try {
+        $j = $Body | ConvertFrom-Json
+        if ($j.error_summary) { return [string]$j.error_summary }
+        if ($j.error -and $j.error.'.tag') { return [string]$j.error.'.tag' }
+    } catch {}
+    return $null
+}
+
+function Get-DropboxCorrectOffset {
+    param([string] $Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return $null }
+    try {
+        $j = $Body | ConvertFrom-Json
+        if ($j.error -and $j.error.'.tag' -eq 'incorrect_offset' -and $j.error.correct_offset -ne $null) {
+            return [long]$j.error.correct_offset
+        }
+        if ($j.error -and $j.error.lookup_failed -and
+            $j.error.lookup_failed.'.tag' -eq 'incorrect_offset' -and
+            $j.error.lookup_failed.correct_offset -ne $null) {
+            return [long]$j.error.lookup_failed.correct_offset
+        }
+    } catch {}
+    return $null
+}
+
+function Format-DropboxFailure {
+    param(
+        [string] $Prefix,
+        [string] $Body
+    )
+    $summary = Get-DropboxErrorSummary $Body
+    if ($summary) { return "$Prefix ($summary): $Body" }
+    if (-not [string]::IsNullOrWhiteSpace($Body)) { return "$Prefix`: $Body" }
+    return $Prefix
+}
+
+function Send-DropboxChunk {
+    param(
+        [Parameter(Mandatory = $true)][System.Net.Http.HttpClient] $Client,
+        [Parameter(Mandatory = $true)][string] $SessionId,
+        [Parameter(Mandatory = $true)][string] $AccessToken,
+        [Parameter(Mandatory = $true)][byte[]] $Bytes,
+        [Parameter(Mandatory = $true)][long] $Offset
+    )
+
+    $request = New-Object System.Net.Http.HttpRequestMessage -ArgumentList ([System.Net.Http.HttpMethod]::Post), 'https://content.dropboxapi.com/2/files/upload_session/append_v2'
+    $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $AccessToken)
+    $arg = @{
+        cursor = @{
+            session_id = $SessionId
+            offset = $Offset
+        }
+        close = $false
+    }
+    $request.Headers.TryAddWithoutValidation('Dropbox-API-Arg', (ConvertTo-DropboxApiJson $arg)) | Out-Null
+    $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,$Bytes)
+    $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
+    $request.Content = $content
+    try {
+        return Wait-HttpTask ($Client.SendAsync($request))
+    }
+    finally {
+        $request.Dispose()
+        $content.Dispose()
+    }
+}
+
+function Finish-DropboxUploadSession {
+    param(
+        [Parameter(Mandatory = $true)][System.Net.Http.HttpClient] $Client,
+        [Parameter(Mandatory = $true)][string] $SessionId,
+        [Parameter(Mandatory = $true)][string] $AccessToken,
+        [Parameter(Mandatory = $true)][byte[]] $Bytes,
+        [Parameter(Mandatory = $true)][long] $Offset,
+        [Parameter(Mandatory = $true)][string] $DropboxPath
+    )
+
+    $request = New-Object System.Net.Http.HttpRequestMessage -ArgumentList ([System.Net.Http.HttpMethod]::Post), 'https://content.dropboxapi.com/2/files/upload_session/finish'
+    $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $AccessToken)
+    $arg = @{
+        cursor = @{
+            session_id = $SessionId
+            offset = $Offset
+        }
+        commit = @{
+            path = $DropboxPath
+            mode = 'add'
+            autorename = $true
+            mute = $true
+        }
+    }
+    $request.Headers.TryAddWithoutValidation('Dropbox-API-Arg', (ConvertTo-DropboxApiJson $arg)) | Out-Null
+    $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,$Bytes)
+    $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
+    $request.Content = $content
+    try {
+        return Wait-HttpTask ($Client.SendAsync($request))
+    }
+    finally {
+        $request.Dispose()
+        $content.Dispose()
+    }
+}
+
+function Sync-UploadPosition {
+    # У Dropbox нет отдельного status-запроса для upload session. Если предыдущий
+    # чанк был принят, повтор обычно вернёт incorrect_offset с correct_offset;
+    # этот случай обрабатывается в основном цикле по телу HTTP 409.
+    param(
+        [Parameter(Mandatory = $true)] $Client,
+        [Parameter(Mandatory = $true)] $Session,
+        [AllowEmptyString()][string] $AccessToken = ''
+    )
+    return
+}
+
+function New-DropboxSharedLink {
+    param(
+        [Parameter(Mandatory = $true)][string] $AccessToken,
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $body = ConvertTo-DropboxApiJson @{ path = $Path; settings = @{} }
+    try {
+        $resp = Invoke-RestMethod `
+            -Method Post `
+            -Uri 'https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings' `
+            -Headers $headers `
+            -ContentType 'application/json' `
+            -Body $body
+        if ($resp.url) { return [string]$resp.url }
+    }
+    catch {
+        $detail = Get-WebExceptionDetail $_
+        if (-not ($detail.Body -and $detail.Body -match 'shared_link_already_exists')) {
+            Write-Log "Dropbox shared link не создан: $($_.Exception.Message)"
+            if ($detail.Body) { Write-Log "Dropbox shared link detail: $($detail.Body)" }
+            return $null
+        }
+    }
+
+    try {
+        $resp = Invoke-RestMethod `
+            -Method Post `
+            -Uri 'https://api.dropboxapi.com/2/sharing/list_shared_links' `
+            -Headers $headers `
+            -ContentType 'application/json' `
+            -Body (ConvertTo-DropboxApiJson @{ path = $Path; direct_only = $true })
+        if ($resp.links -and $resp.links.Count -gt 0 -and $resp.links[0].url) {
+            return [string]$resp.links[0].url
+        }
+    }
+    catch {
+        Write-Log "Dropbox shared link lookup не удался: $($_.Exception.Message)"
+    }
+
+    return $null
+}
+
+
+
+
+function Upload-RecordedFiles {
+    # Параллельная (interleaved) загрузка нескольких файлов.
+    # Все файлы стартуют одновременно: открываем resumable-session для каждого,
+    # далее в цикле round-robin отправляем по одному 32 МБ-чанку каждой активной сессии.
+    # Это:
+    #  - даёт визуально одновременный прогресс всех файлов (а не последовательный)
+    #  - использует ОДИН HttpClient (keep-alive) — экономичнее, чем по соединению на файл
+    #  - при потерянном ответе Dropbox возвращает incorrect_offset, и позиция безопасно
+    #    сдвигается только вперёд.
+    param([System.IO.FileInfo[]] $Files)
+    $files = $Files
+
+    if (-not $files -or $files.Count -eq 0) {
+        Write-Step 'Файлы для загрузки не выбраны.'
+        return
+    }
+
+    Write-Step ("Файлов к загрузке: {0}" -f $files.Count)
+    $totalSizeBytes = ($files | Measure-Object -Property Length -Sum).Sum
+    $totalSizeGb = [math]::Round($totalSizeBytes / 1GB, 2)
+    Write-Step ("Общий объём: {0} ГБ" -f $totalSizeGb)
+
+    # Берём короткоживущий Dropbox access token из refresh token.
+    $accessToken = Get-DropboxAccessToken -Force
+    Ensure-DropboxUploadFolder -AccessToken $accessToken
+
+    # Открываем сессии и стримы для каждого файла. Если для одного не получилось —
+    # помечаем ошибкой, но не валим остальные.
+    $sessions = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $files) {
+        $s = [pscustomobject]@{
+            File       = $f
+            Name       = $f.Name
+            Size       = [long]$f.Length
+            MimeType   = (Get-VideoMimeType -InputFile $f.FullName)
+            DropboxPath = (Get-DropboxUploadPath -File $f)
+            SessionId  = $null
+            Stream     = $null
+            Position   = [long]0
+            ErrorCount = 0
+            AuthRetries = 0
+            Done       = $false
+            Error      = $null
+            LastDetail = $null
+            Result     = $null
+        }
+        try {
+            $s.SessionId = New-DropboxUploadSession -AccessToken $accessToken -InputFile $f.FullName
+            $s.Stream = [IO.File]::OpenRead($f.FullName)
+        }
+        catch {
+            $s.Error = "Не удалось открыть сессию: $($_.Exception.Message)"
+        }
+        $sessions.Add($s) | Out-Null
+    }
+
+    # Инициализируем состояние прогресса
+    Initialize-MultiProgress -Names ($sessions | ForEach-Object { $_.Name })
+    foreach ($s in $sessions) {
+        if ($s.Error) {
+            Show-UploadProgress -FileName $s.Name -Uploaded 0 -Total $s.Size -Status 'error'
+        } else {
+            Show-UploadProgress -FileName $s.Name -Uploaded 0 -Total $s.Size -Status 'active'
+        }
+    }
+
+    $chunkSize  = [long](32MB)
+    $buffer     = New-Object byte[] $chunkSize
+    $maxRetries = 5
+
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromHours(2)
+    $client.DefaultRequestHeaders.ConnectionClose = $false
+    $client.DefaultRequestHeaders.ExpectContinue = $false
+
+    try {
+        # Главный цикл: круговой обход всех активных сессий, по 1 чанку за проход.
+        while ($true) {
+            $active = $sessions | Where-Object { -not $_.Done -and -not $_.Error }
+            if (-not $active) { break }
+
+            foreach ($s in $active) {
+                if ($s.Done -or $s.Error) { continue }
+                if ($s.Position -ge $s.Size) {
+                    # Все байты уже приняты сессией, но файл ещё нужно закоммитить.
+                    try {
+                        $accessToken = Get-DropboxAccessToken
+                        $response = Finish-DropboxUploadSession -Client $client -SessionId $s.SessionId `
+                            -AccessToken $accessToken -Bytes ([byte[]]@()) -Offset $s.Size -DropboxPath $s.DropboxPath
+                        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                        if ($response.IsSuccessStatusCode) {
+                            $s.Done = $true
+                            try { $s.Result = $body | ConvertFrom-Json } catch {}
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Size -Total $s.Size -Status 'done'
+                        } else {
+                            $s.LastDetail = $body
+                            $s.Error = Format-DropboxFailure "Dropbox finish HTTP $([int]$response.StatusCode)" $body
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                        }
+                    }
+                    catch {
+                        $s.Error = "Не удалось завершить Dropbox upload session: $($_.Exception.Message)"
+                        Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                    }
+                    continue
+                }
+
+                # Освежаем токен: кэш сам обновит его, если до истечения < 5 минут
+                # (спасает загрузки длиннее часа).
+                try { $accessToken = Get-DropboxAccessToken }
+                catch { Write-Log "Не удалось обновить токен: $($_.Exception.Message)" }
+                $chunkToken = $accessToken
+
+                # Читаем очередной чанк
+                $s.Stream.Position = $s.Position
+                $remaining = $s.Size - $s.Position
+                $readSize  = [int][math]::Min($chunkSize, $remaining)
+                $read      = $s.Stream.Read($buffer, 0, $readSize)
+                if ($read -le 0) {
+                    $s.Error = 'Неожиданный конец файла при чтении блока.'
+                    Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                    continue
+                }
+                $chunk = New-Object byte[] $read
+                [Array]::Copy($buffer, 0, $chunk, 0, $read)
+                $start = $s.Position
+                $end   = $s.Position + $read - 1
+                $isFinalChunk = ($end -ge ($s.Size - 1))
+
+                try {
+                    if ($isFinalChunk) {
+                        $response = Finish-DropboxUploadSession -Client $client -SessionId $s.SessionId `
+                            -AccessToken $chunkToken -Bytes $chunk -Offset $start -DropboxPath $s.DropboxPath
+                    } else {
+                        $response = Send-DropboxChunk -Client $client -SessionId $s.SessionId `
+                            -AccessToken $chunkToken -Bytes $chunk -Offset $start
+                    }
+                    $statusCode   = [int]$response.StatusCode
+                    $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+                    if ($response.IsSuccessStatusCode) {
+                        $s.ErrorCount  = 0
+                        $s.AuthRetries = 0
+                        if ($isFinalChunk) {
+                            $s.Position = $s.Size
+                            $s.Done     = $true
+                            try { $s.Result = $responseBody | ConvertFrom-Json } catch {}
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Size -Total $s.Size -Status 'done'
+                        } else {
+                            $s.Position = $end + 1
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'active'
+                        }
+                    }
+                    elseif ($statusCode -eq 401) {
+                        # Токен протух во время загрузки — обновляем и повторяем ЭТОТ ЖЕ чанк,
+                        # не считая это ошибкой и не трогая позицию.
+                        $s.AuthRetries++
+                        Write-Log "401 на $($s.Name): обновляем токен (попытка $($s.AuthRetries))"
+                        if ($s.AuthRetries -gt 3) {
+                            $s.Error = 'Повторный 401: не удаётся обновить токен.'
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                        }
+                        else {
+                            try { $accessToken = Get-DropboxAccessToken -Force }
+                            catch { Write-Log "Обновление токена не удалось: $($_.Exception.Message)" }
+                        }
+                    }
+                    elseif ($statusCode -eq 409) {
+                        $s.LastDetail = $responseBody
+                        $correctOffset = Get-DropboxCorrectOffset -Body $responseBody
+                        if ($correctOffset -ne $null -and $correctOffset -ge $s.Position) {
+                            Write-Log "Dropbox incorrect_offset на $($s.Name): server=$correctOffset local=$($s.Position)"
+                            $s.Position = [long]$correctOffset
+                            $s.ErrorCount = 0
+                            Show-UploadProgress -FileName $s.Name -Uploaded ([math]::Min($s.Position, $s.Size)) -Total $s.Size -Status 'active'
+                        } else {
+                            $s.ErrorCount++
+                            Write-Log "Dropbox HTTP 409 на $($s.Name): $responseBody"
+                            if ($s.ErrorCount -gt $maxRetries) {
+                                $s.Error = Format-DropboxFailure "Dropbox HTTP 409 после $maxRetries попыток" $responseBody
+                                Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                            }
+                            else {
+                                Start-Sleep -Milliseconds ([int][math]::Min(5000, [math]::Pow(2, $s.ErrorCount) * 250))
+                            }
+                        }
+                    }
+                    else {
+                        $s.LastDetail = $responseBody
+                        if ($statusCode -eq 403) {
+                            $reason = Get-DropboxErrorSummary $responseBody
+                            $s.Error = Format-DropboxFailure "Dropbox отказал (403 $reason)" $responseBody
+                            Write-Log "Dropbox 403 ($reason) на $($s.Name): $responseBody"
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                            continue
+                        }
+                        # Прочие 4xx/5xx — счётчик + безопасный ресинк позиции.
+                        $s.ErrorCount++
+                        Write-Log "Chunk HTTP $statusCode на $($s.Name): $responseBody"
+                        if ($s.ErrorCount -gt $maxRetries) {
+                            $s.Error = Format-DropboxFailure "HTTP $statusCode после $maxRetries попыток" $responseBody
+                            Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                        }
+                        else {
+                            Sync-UploadPosition -Client $client -Session $s -AccessToken $chunkToken
+                            Start-Sleep -Milliseconds ([int][math]::Min(5000, [math]::Pow(2, $s.ErrorCount) * 250))
+                        }
+                    }
+                }
+                catch {
+                    # Транспортная ошибка (HTTP-ответа не было): повторяем чанк с
+                    # экспоненциальной паузой, предварительно пересинхронизировав позицию.
+                    $s.ErrorCount++
+                    Write-Log "Транспорт на $($s.Name) (попытка $($s.ErrorCount)/$maxRetries): $($_.Exception.Message)"
+                    if ($s.ErrorCount -gt $maxRetries) {
+                        $s.Error = $_.Exception.Message
+                        Show-UploadProgress -FileName $s.Name -Uploaded $s.Position -Total $s.Size -Status 'error'
+                    }
+                    else {
+                        Sync-UploadPosition -Client $client -Session $s -AccessToken $accessToken
+                        Start-Sleep -Milliseconds ([int][math]::Min(5000, [math]::Pow(2, $s.ErrorCount) * 250))
+                    }
+                }
+            }
+        }
+    }
+    finally {
+        foreach ($s in $sessions) {
+            if ($s.Stream) { try { $s.Stream.Dispose() } catch {} }
+        }
+        try { $client.Dispose() } catch {}
+    }
+
+    # Очищаем состояние прогресса, выводим финальные строки на каждый файл.
+    Clear-UploadProgress
+    $uploadErrors = 0
+    $hist = Load-UploadHistory          # читаем историю один раз...
+    $histChanged = $false
+    foreach ($s in $sessions) {
+        if ($s.Done) {
+            $dropboxPath = if ($s.Result -and $s.Result.path_display) { [string]$s.Result.path_display } else { $s.DropboxPath }
+            $shareLink = $null
+            try {
+                $shareLink = New-DropboxSharedLink -AccessToken (Get-DropboxAccessToken) -Path $dropboxPath
+            } catch {}
+            $link = if ($shareLink) { $shareLink } else { $dropboxPath }
+            Write-Step "✓ $($s.Name) → $link"
+            $dedupKey = $null
+            if ($script:UploadDedupKeys -and $script:UploadDedupKeys.ContainsKey($s.File.FullName)) {
+                $dedupKey = $script:UploadDedupKeys[$s.File.FullName]
+            }
+            if (-not $dedupKey) { $dedupKey = Get-FileDedupSignature -Path $s.File.FullName }
+            if ($dedupKey) {
+                $dropboxId = if ($s.Result) { $s.Result.id } else { $null }
+                $hist[$dedupKey] = [pscustomobject]@{
+                    key         = $dedupKey
+                    name        = $s.File.Name
+                    size        = $s.File.Length
+                    dropbox_id  = $dropboxId
+                    dropbox_path = $dropboxPath
+                    uploaded_at = (Get-Date).ToUniversalTime().ToString('o')
+                }
+                $histChanged = $true
+            }
+        }
+        else {
+            $uploadErrors++
+            $reason = if ($s.Error) { $s.Error } else { 'неизвестная ошибка' }
+            Write-Step "✗ $($s.Name): $reason"
+        }
+    }
+    if ($histChanged) { Save-UploadHistory $hist }   # ...и сохраняем один раз
+
+    Write-Step 'Все записи загружены в Dropbox. Окно можно закрыть.'
+
+    if ($uploadErrors -gt 0) {
+        $details = @(
+            foreach ($s in $sessions) {
+                if (-not $s.Done) {
+                    $reason = if ($s.Error) { [string]$s.Error } else { 'неизвестная ошибка' }
+                    "- $($s.Name): $reason"
+                }
+            }
+        )
+        $detailText = if ($details.Count -gt 0) { "`r`n" + ($details -join "`r`n") } else { '' }
+        throw "Загрузка завершена с ошибками: $uploadErrors из $($files.Count) файлов не было загружено.$detailText"
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Локальное хранилище настроек (JSON в %APPDATA%\goodwin_obs\settings.json)
+# ═══════════════════════════════════════════════════════════════════════════════
+function Load-LocalSettings {
+    if (-not (Test-Path $script:SettingsFile)) { return @{} }
+    try {
+        $raw = Get-Content -Raw -Path $script:SettingsFile -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $obj = $raw | ConvertFrom-Json
+        $h = @{}
+        foreach ($p in $obj.PSObject.Properties) { $h[$p.Name] = $p.Value }
+        return $h
+    } catch {
+        Write-Log "Не удалось прочитать settings.json: $($_.Exception.Message)"
+        return @{}
+    }
+}
+
+function Save-LocalSettings {
+    param([hashtable] $Data)
+    try {
+        $json = $Data | ConvertTo-Json -Compress
+        Write-TextFileAtomic -Path $script:SettingsFile -Content $json
+    } catch {
+        Write-Log "Не удалось сохранить settings.json: $($_.Exception.Message)"
+    }
+}
+
+function Save-CurrentSettings {
+    Save-LocalSettings @{
+        nickname      = $script:SelectedNickname
+        recordingRoot = $script:RecordingRoot
+        camera        = $script:SelectedCamera
+        mic           = $script:SelectedMic
+    }
+}
+
+# ── Лог уже загруженных файлов (защита от дублей) ─────────────────────────
+# Хранится в %APPDATA%\goodwin_obs\uploaded.json. Каждая запись:
+# { name, size, sha1_head, dropbox_id, dropbox_path, uploaded_at }. Ключ дедупа: "name|size|sha1_head".
+# SHA-1 считается по первым 1 МБ — достаточно для отсечения дублей, быстро на больших файлах.
+
+function Get-FileDedupSignature {
+    # Подпись = имя|размер|SHA1 по трём окнам (начало+середина+конец, по 256 КБ).
+    # Несколько окон вместо «только первый мегабайт» убирают ложные совпадения
+    # у видео с одинаковым заголовком контейнера.
+    param([Parameter(Mandatory=$true)][string] $Path)
+    try {
+        $fi = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($fi.Length -le 0) { return "{0}|{1}|empty" -f $fi.Name, $fi.Length }
+
+        $win = [long]262144   # 256 КБ
+        $offsets = @([long]0)
+        if ($fi.Length -gt (2 * $win)) { $offsets += [long][math]::Floor($fi.Length / 2) }
+        if ($fi.Length -gt $win)       { $offsets += [long]($fi.Length - $win) }
+        $offsets = @($offsets | Sort-Object -Unique)
+
+        $sha = [System.Security.Cryptography.SHA1]::Create()
+        $fs  = [IO.File]::OpenRead($Path)
+        try {
+            $buf = New-Object byte[] $win
+            foreach ($off in $offsets) {
+                $fs.Position = $off
+                $want = [int][math]::Min($win, ($fi.Length - $off))
+                $read = $fs.Read($buf, 0, $want)
+                if ($read -gt 0) { $null = $sha.TransformBlock($buf, 0, $read, $buf, 0) }
+            }
+            $null = $sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+            $hex = -join ($sha.Hash | ForEach-Object { $_.ToString('x2') })
+            return "{0}|{1}|{2}" -f $fi.Name, $fi.Length, $hex
+        }
+        finally { $fs.Dispose(); $sha.Dispose() }
+    } catch {
+        # Если не смогли посчитать — отдаём имя+размер, лучше чем ничего (но логируем).
+        $fi = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if ($fi) {
+            Write-Log "Подпись файла $($fi.Name) не посчитана, дедуп по имени+размеру: $($_.Exception.Message)"
+            return "{0}|{1}|nohash" -f $fi.Name, $fi.Length
+        }
+        return $null
+    }
+}
+
+function Load-UploadHistory {
+    if (-not (Test-Path $script:UploadHistoryFile)) { return @{} }
+    try {
+        $raw = Get-Content -Raw -Path $script:UploadHistoryFile -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $arr = ConvertFrom-Json $raw
+        $h = @{}
+        foreach ($e in $arr) {
+            if ($e.key) { $h[[string]$e.key] = $e }
+        }
+        return $h
+    } catch {
+        Write-Log "Не удалось прочитать uploaded.json: $($_.Exception.Message)"
+        return @{}
+    }
+}
+
+function Save-UploadHistory {
+    param([hashtable] $History)
+    try {
+        $dir = Split-Path -Parent $script:UploadHistoryFile
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $arr = @($History.Values)
+        $json = $arr | ConvertTo-Json -Depth 4 -Compress
+        if (-not $json) { $json = '[]' }
+        Write-TextFileAtomic -Path $script:UploadHistoryFile -Content $json
+    } catch {
+        Write-Log "Не удалось сохранить uploaded.json: $($_.Exception.Message)"
+    }
+}
+
+function Add-UploadHistoryEntry {
+    param(
+        [Parameter(Mandatory=$true)][string] $Key,
+        [Parameter(Mandatory=$true)][System.IO.FileInfo] $File,
+        [string] $DropboxId,
+        [string] $DropboxPath
+    )
+    $hist = Load-UploadHistory
+    $hist[$Key] = [pscustomobject]@{
+        key         = $Key
+        name        = $File.Name
+        size        = $File.Length
+        dropbox_id  = $DropboxId
+        dropbox_path = $DropboxPath
+        uploaded_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    Save-UploadHistory $hist
+}
+
+function Get-FileMd5 {
+    param([Parameter(Mandatory=$true)][string] $Path)
+    try {
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        $fs  = [IO.File]::OpenRead($Path)
+        try {
+            $hash = $md5.ComputeHash($fs)
+            return (-join ($hash | ForEach-Object { $_.ToString('x2') }))
+        }
+        finally { $fs.Dispose(); $md5.Dispose() }
+    } catch {
+        Write-Log "Не удалось посчитать MD5 для $($Path): $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Test-UploadedOnDropbox {
+    # Проверяет в Dropbox точный путь файла в целевой папке. Если файл есть и размер
+    # совпадает, считаем его уже загруженным. Возвращает $false при ошибке, чтобы
+    # сетевая проблема не блокировала загрузку.
+    # Возвращает $false при ошибке — чтобы сетевая проблема не блокировала загрузку.
+    param(
+        [Parameter(Mandatory=$true)][string] $AccessToken,
+        [Parameter(Mandatory=$true)][System.IO.FileInfo] $File,
+        [Parameter(Mandatory=$true)][long]   $Size,
+        [string] $Path
+    )
+    try {
+        $dropboxPath = Get-DropboxUploadPath -File $File
+        $headers = @{ Authorization = "Bearer $AccessToken" }
+        $resp = Invoke-RestMethod `
+            -Method Post `
+            -Uri 'https://api.dropboxapi.com/2/files/get_metadata' `
+            -Headers $headers `
+            -ContentType 'application/json' `
+            -Body (ConvertTo-DropboxApiJson @{ path = $dropboxPath; include_media_info = $false; include_deleted = $false; include_has_explicit_shared_members = $false })
+        return ($resp -and $resp.'.tag' -eq 'file' -and [long]$resp.size -eq $Size)
+    }
+    catch {
+        $detail = Get-WebExceptionDetail $_
+        if ($detail.Body -and $detail.Body -match 'not_found') { return $false }
+        Write-Log "Dropbox dedup check failed (продолжаем без удалённой проверки): $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CoreAudio: уровень микрофона через IAudioMeterInformation
+# ═══════════════════════════════════════════════════════════════════════════════
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace GoodwinCoreAudio {
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    public class MMDeviceEnumeratorComObject { }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDeviceEnumerator {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IMMDeviceCollection ppDevices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+        [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string pwstrId, out IMMDevice ppDevice);
+    }
+
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDeviceCollection {
+        [PreserveSig] int GetCount(out int pcDevices);
+        [PreserveSig] int Item(int nDevice, out IMMDevice ppDevice);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDevice {
+        [PreserveSig] int Activate([MarshalAs(UnmanagedType.LPStruct)] Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+        [PreserveSig] int OpenPropertyStore(int stgmAccess, out IPropertyStore ppProperties);
+        [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string ppstrId);
+        [PreserveSig] int GetState(out int pdwState);
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PROPERTYKEY {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct PROPVARIANT {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr pszVal;
+    }
+
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyStore {
+        [PreserveSig] int GetCount(out int cProps);
+        [PreserveSig] int GetAt(int iProp, out PROPERTYKEY pkey);
+        [PreserveSig] int GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+    }
+
+    [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IAudioMeterInformation {
+        [PreserveSig] int GetPeakValue(out float pfPeak);
+    }
+
+    public static class AudioMeter {
+        const int eCapture = 1;
+        const int DEVICE_STATE_ACTIVE = 1;
+        const int CLSCTX_INPROC_SERVER = 1;
+        const int STGM_READ = 0;
+        const ushort VT_LPWSTR = 31;
+
+        static readonly PROPERTYKEY PKEY_Device_FriendlyName = new PROPERTYKEY {
+            fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"),
+            pid = 14
+        };
+
+        [DllImport("ole32.dll")]
+        static extern int PropVariantClear(ref PROPVARIANT pvar);
+
+        public static float GetPeakByName(string name) {
+            if (string.IsNullOrEmpty(name)) return GetDefaultCapturePeak();
+            var en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            try {
+                IMMDeviceCollection col;
+                if (en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, out col) != 0 || col == null) return 0f;
+                try {
+                    int count;
+                    col.GetCount(out count);
+                    for (int i = 0; i < count; i++) {
+                        IMMDevice dev;
+                        if (col.Item(i, out dev) != 0 || dev == null) continue;
+                        try {
+                            IPropertyStore props;
+                            if (dev.OpenPropertyStore(STGM_READ, out props) != 0 || props == null) continue;
+                            string fn = null;
+                            try {
+                                var key = PKEY_Device_FriendlyName;
+                                PROPVARIANT pv;
+                                if (props.GetValue(ref key, out pv) == 0) {
+                                    try {
+                                        if (pv.vt == VT_LPWSTR && pv.pszVal != IntPtr.Zero) {
+                                            fn = Marshal.PtrToStringUni(pv.pszVal);
+                                        }
+                                    } finally { PropVariantClear(ref pv); }
+                                }
+                            } finally { Marshal.ReleaseComObject(props); }
+                            if (fn == name) {
+                                return GetPeakFromDevice(dev);
+                            }
+                        } finally { Marshal.ReleaseComObject(dev); }
+                    }
+                } finally { Marshal.ReleaseComObject(col); }
+            } finally { Marshal.ReleaseComObject(en); }
+            return 0f;
+        }
+
+        public static float GetDefaultCapturePeak() {
+            var en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            try {
+                IMMDevice dev;
+                if (en.GetDefaultAudioEndpoint(eCapture, 0, out dev) != 0 || dev == null) return 0f;
+                try {
+                    return GetPeakFromDevice(dev);
+                } finally { Marshal.ReleaseComObject(dev); }
+            } finally { Marshal.ReleaseComObject(en); }
+        }
+
+        // Уровень по точному MMDevice-id, БЕЗ перебора всех устройств — для таймера,
+        // который раньше энумерировал все capture-устройства ~12 раз в секунду.
+        public static float GetPeakById(string id) {
+            if (string.IsNullOrEmpty(id)) return GetDefaultCapturePeak();
+            var en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            try {
+                IMMDevice dev;
+                if (en.GetDevice(id, out dev) != 0 || dev == null) return 0f;
+                try {
+                    return GetPeakFromDevice(dev);
+                } finally { Marshal.ReleaseComObject(dev); }
+            } finally { Marshal.ReleaseComObject(en); }
+        }
+
+        // Возвращает массив пар "FriendlyName|DeviceId" для всех активных
+        // capture-устройств. Имя берём из IPropertyStore::PKEY_Device_FriendlyName —
+        // ровно то же значение, которое использует OBS (например, "Микрофон (FIFINE K670 Microphone)").
+        public static string[] EnumerateCaptureDevices() {
+            var result = new System.Collections.Generic.List<string>();
+            var en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            try {
+                IMMDeviceCollection col;
+                if (en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, out col) != 0 || col == null) return result.ToArray();
+                try {
+                    int count;
+                    col.GetCount(out count);
+                    for (int i = 0; i < count; i++) {
+                        IMMDevice dev;
+                        if (col.Item(i, out dev) != 0 || dev == null) continue;
+                        try {
+                            string deviceId = null;
+                            dev.GetId(out deviceId);
+
+                            IPropertyStore props;
+                            if (dev.OpenPropertyStore(STGM_READ, out props) != 0 || props == null) continue;
+                            string fn = null;
+                            try {
+                                var key = PKEY_Device_FriendlyName;
+                                PROPVARIANT pv;
+                                if (props.GetValue(ref key, out pv) == 0) {
+                                    try {
+                                        if (pv.vt == VT_LPWSTR && pv.pszVal != IntPtr.Zero) {
+                                            fn = Marshal.PtrToStringUni(pv.pszVal);
+                                        }
+                                    } finally { PropVariantClear(ref pv); }
+                                }
+                            } finally { Marshal.ReleaseComObject(props); }
+
+                            if (!string.IsNullOrEmpty(fn) && !string.IsNullOrEmpty(deviceId)) {
+                                result.Add(fn + "|" + deviceId);
+                            }
+                        } finally { Marshal.ReleaseComObject(dev); }
+                    }
+                } finally { Marshal.ReleaseComObject(col); }
+            } finally { Marshal.ReleaseComObject(en); }
+            return result.ToArray();
+        }
+
+        static float GetPeakFromDevice(IMMDevice dev) {
+            object meterObj;
+            var iid = typeof(IAudioMeterInformation).GUID;
+            if (dev.Activate(iid, CLSCTX_INPROC_SERVER, IntPtr.Zero, out meterObj) != 0 || meterObj == null) return 0f;
+            try {
+                var meter = (IAudioMeterInformation)meterObj;
+                float peak;
+                if (meter.GetPeakValue(out peak) != 0) return 0f;
+                return peak;
+            } finally { Marshal.ReleaseComObject(meterObj); }
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MCI: запись и воспроизведение для проверки микрофона
+# ═══════════════════════════════════════════════════════════════════════════════
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class MciWrapper {
+    [DllImport("winmm.dll", CharSet = CharSet.Auto)]
+    public static extern int mciSendString(string lpstrCommand, StringBuilder lpstrReturnString, int uReturnLength, IntPtr hwndCallback);
+    [DllImport("winmm.dll", CharSet = CharSet.Auto)]
+    public static extern bool mciGetErrorString(int errCode, StringBuilder lpstrBuffer, int uLength);
+}
+'@ -ErrorAction SilentlyContinue
+
+function Get-MciError {
+    param([int] $Code)
+    $b = New-Object System.Text.StringBuilder 256
+    [void][MciWrapper]::mciGetErrorString($Code, $b, 256)
+    return $b.ToString()
+}
+
+function Start-MicrophoneTest {
+    param([int] $DurationSec = 3)
+    $tempWav = Join-Path $env:TEMP 'goodwin_mic_test.wav'
+    $sb = New-Object System.Text.StringBuilder 256
+    if (Test-Path $tempWav) { Remove-Item -LiteralPath $tempWav -Force -ErrorAction SilentlyContinue }
+
+    # Гарантируем, что alias 'mic_test' будет закрыт даже если record/save выкинут исключение —
+    # иначе MCI-устройство остаётся открытым и следующий тест валится.
+    [MciWrapper]::mciSendString('close mic_test', $sb, 256, [IntPtr]::Zero) | Out-Null
+    $rcOpen = [MciWrapper]::mciSendString('open new type waveaudio alias mic_test', $sb, 256, [IntPtr]::Zero)
+    if ($rcOpen -ne 0) {
+        throw "Не удалось открыть устройство записи (MCI ${rcOpen}: $(Get-MciError $rcOpen))."
+    }
+    try {
+        [MciWrapper]::mciSendString('set mic_test bitspersample 16 channels 1 samplespersec 44100 format tag pcm', $sb, 256, [IntPtr]::Zero) | Out-Null
+        $rcRec = [MciWrapper]::mciSendString('record mic_test', $sb, 256, [IntPtr]::Zero)
+        if ($rcRec -ne 0) {
+            throw "Не удалось начать запись с микрофона (MCI ${rcRec}: $(Get-MciError $rcRec)). Возможно, устройство занято или не подключено."
+        }
+        Start-Sleep -Seconds $DurationSec
+        [MciWrapper]::mciSendString('stop mic_test', $sb, 256, [IntPtr]::Zero) | Out-Null
+        [MciWrapper]::mciSendString("save mic_test `"$tempWav`"", $sb, 256, [IntPtr]::Zero) | Out-Null
+    }
+    finally {
+        [MciWrapper]::mciSendString('close mic_test', $sb, 256, [IntPtr]::Zero) | Out-Null
+    }
+    if (Test-Path $tempWav) {
+        $player = New-Object System.Media.SoundPlayer
+        try {
+            $player.SoundLocation = $tempWav
+            $player.PlaySync()
+        }
+        finally {
+            $player.Dispose()
+            Remove-Item -LiteralPath $tempWav -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DirectShow: живой предпросмотр камеры в окне (HWND нашей панели)
+# ═══════════════════════════════════════════════════════════════════════════════
+Add-Type -ReferencedAssemblies System.Runtime.InteropServices -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+namespace GoodwinCam {
+    // Маркер IBaseFilter — нужен, чтобы COM-маршаллер делал правильный
+    // QueryInterface(IBaseFilter) при передаче фильтра в AddFilter/RenderStream.
+    // Без него передавался IUnknown*, и AddFilter падал с AccessViolation,
+    // потому что у IUnknown и IBaseFilter разные vtable.
+    [ComImport, Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IBaseFilter { }
+
+    [ComImport, Guid("56A868A9-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IGraphBuilder {
+        [PreserveSig] int AddFilter([In] IBaseFilter pFilter, [MarshalAs(UnmanagedType.LPWStr)] string pName);
+    }
+
+    [ComImport, Guid("93E5A4E0-2D50-11D2-ABFA-00A0C9C6E38D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface ICaptureGraphBuilder2 {
+        // Все параметры строго типизированы — у IGraphBuilder и IBaseFilter
+        // свои vtable, и без явного QI ICaptureGraphBuilder2 тихо ломается.
+        [PreserveSig] int SetFiltergraph([In] IGraphBuilder pfg);
+        [PreserveSig] int _GetFiltergraph_NotUsed();
+        [PreserveSig] int _SetOutputFileName_NotUsed();
+        [PreserveSig] int _FindInterface_NotUsed();
+        [PreserveSig] int RenderStream([In, MarshalAs(UnmanagedType.LPStruct)] Guid pCategory, [In, MarshalAs(UnmanagedType.LPStruct)] Guid pType, [In, MarshalAs(UnmanagedType.IUnknown)] object pSource, [In] IBaseFilter pfCompressor, [In] IBaseFilter pfRenderer);
+    }
+
+    [ComImport, Guid("29840822-5B84-11D0-BD3B-00A0C911CE86"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface ICreateDevEnum {
+        [PreserveSig] int CreateClassEnumerator([In] ref Guid clsidDeviceClass, out IEnumMoniker ppEnumMoniker, int dwFlags);
+    }
+
+    [ComImport, Guid("55272A00-42CB-11CE-8135-00AA004BB851"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyBag {
+        [PreserveSig] int Read([MarshalAs(UnmanagedType.LPWStr)] string pszPropName, [In, Out, MarshalAs(UnmanagedType.Struct)] ref object pVar, IntPtr pErrorLog);
+        [PreserveSig] int Write([MarshalAs(UnmanagedType.LPWStr)] string pszPropName, [In, MarshalAs(UnmanagedType.Struct)] ref object pVar);
+    }
+
+    // IMediaControl — IDispatch (4) + 3 нужных метода
+    [ComImport, Guid("56A868B1-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMediaControl {
+        [PreserveSig] int _GetTypeInfoCount();
+        [PreserveSig] int _GetTypeInfo();
+        [PreserveSig] int _GetIDsOfNames();
+        [PreserveSig] int _Invoke();
+        [PreserveSig] int Run();
+        [PreserveSig] int Pause();
+        [PreserveSig] int Stop();
+    }
+
+    // IVideoWindow — IDispatch (4) + полная vtable до SetWindowPosition
+    [ComImport, Guid("56A868B4-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IVideoWindow {
+        [PreserveSig] int _GetTypeInfoCount();
+        [PreserveSig] int _GetTypeInfo();
+        [PreserveSig] int _GetIDsOfNames();
+        [PreserveSig] int _Invoke();
+        [PreserveSig] int put_Caption([MarshalAs(UnmanagedType.BStr)] string s);
+        [PreserveSig] int get_Caption([MarshalAs(UnmanagedType.BStr)] out string s);
+        [PreserveSig] int put_WindowStyle(int v);
+        [PreserveSig] int get_WindowStyle(out int v);
+        [PreserveSig] int put_WindowStyleEx(int v);
+        [PreserveSig] int get_WindowStyleEx(out int v);
+        [PreserveSig] int put_AutoShow(int v);
+        [PreserveSig] int get_AutoShow(out int v);
+        [PreserveSig] int put_WindowState(int v);
+        [PreserveSig] int get_WindowState(out int v);
+        [PreserveSig] int put_BackgroundPalette(int v);
+        [PreserveSig] int get_BackgroundPalette(out int v);
+        [PreserveSig] int put_Visible(int v);
+        [PreserveSig] int get_Visible(out int v);
+        [PreserveSig] int put_Left(int v);
+        [PreserveSig] int get_Left(out int v);
+        [PreserveSig] int put_Width(int v);
+        [PreserveSig] int get_Width(out int v);
+        [PreserveSig] int put_Top(int v);
+        [PreserveSig] int get_Top(out int v);
+        [PreserveSig] int put_Height(int v);
+        [PreserveSig] int get_Height(out int v);
+        [PreserveSig] int put_Owner(IntPtr o);
+        [PreserveSig] int get_Owner(out IntPtr o);
+        [PreserveSig] int put_MessageDrain(IntPtr d);
+        [PreserveSig] int get_MessageDrain(out IntPtr d);
+        [PreserveSig] int get_BorderColor(out int c);
+        [PreserveSig] int put_BorderColor(int c);
+        [PreserveSig] int get_FullScreenMode(out int m);
+        [PreserveSig] int put_FullScreenMode(int m);
+        [PreserveSig] int SetWindowForeground(int Focus);
+        [PreserveSig] int NotifyOwnerMessage(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam);
+        [PreserveSig] int SetWindowPosition(int Left, int Top, int Width, int Height);
+    }
+
+    public static class CameraPreview {
+        static readonly Guid CLSID_FilterGraph              = new Guid("E436EBB3-524F-11CE-9F53-0020AF0BA770");
+        static readonly Guid CLSID_CaptureGraphBuilder      = new Guid("BF87B6E1-8C27-11D0-B3F0-00AA003761C5");
+        static readonly Guid CLSID_SystemDeviceEnum         = new Guid("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
+        static readonly Guid CLSID_VideoInputDeviceCategory = new Guid("860BB310-5D01-11D0-BD3B-00A0C911CE86");
+        static readonly Guid PIN_CATEGORY_PREVIEW           = new Guid("FB6C4281-0353-11D1-905F-0000C0CC16BA");
+        static readonly Guid PIN_CATEGORY_CAPTURE           = new Guid("FB6C4280-0353-11D1-905F-0000C0CC16BA");
+        static readonly Guid MEDIATYPE_Video                = new Guid("73646976-0000-0010-8000-00AA00389B71");
+        static readonly Guid IID_IPropertyBag               = new Guid("55272A00-42CB-11CE-8135-00AA004BB851");
+        static readonly Guid IID_IBaseFilter                = new Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770");
+
+        const int WS_CHILD        = 0x40000000;
+        const int WS_CLIPCHILDREN = 0x02000000;
+        const int WS_CLIPSIBLINGS = 0x04000000;
+        const int OATRUE  = -1;
+        const int OAFALSE = 0;
+
+        static object _graph;
+        static object _builder;
+        static IBaseFilter _filter;
+        static IntPtr _hwnd;
+
+        // Возвращает имена всех видеовходов в том же виде, в каком их видит OBS
+        // (через DirectShow System Device Enumerator).
+        public static string[] EnumerateVideoDevices() {
+            var result = new System.Collections.Generic.List<string>();
+            object devEnum = null;
+            try {
+                devEnum = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_SystemDeviceEnum));
+                Guid cat = CLSID_VideoInputDeviceCategory;
+                IEnumMoniker enumMon;
+                ((ICreateDevEnum)devEnum).CreateClassEnumerator(ref cat, out enumMon, 0);
+                if (enumMon != null) {
+                    try {
+                        IMoniker[] arr = new IMoniker[1];
+                        while (enumMon.Next(1, arr, IntPtr.Zero) == 0 && arr[0] != null) {
+                            try {
+                                Guid bagIid = IID_IPropertyBag;
+                                object bagObj;
+                                arr[0].BindToStorage(null, null, ref bagIid, out bagObj);
+                                IPropertyBag bag = (IPropertyBag)bagObj;
+                                object friendly = null;
+                                bag.Read("FriendlyName", ref friendly, IntPtr.Zero);
+                                Marshal.ReleaseComObject(bag);
+                                string fn = friendly as string;
+                                if (!string.IsNullOrEmpty(fn)) {
+                                    result.Add(fn);
+                                }
+                            } catch { }
+                            Marshal.ReleaseComObject(arr[0]);
+                            arr[0] = null;
+                        }
+                    } finally { Marshal.ReleaseComObject(enumMon); }
+                }
+            } catch { }
+            finally {
+                if (devEnum != null) { try { Marshal.ReleaseComObject(devEnum); } catch { } }
+            }
+            return result.ToArray();
+        }
+
+        public static void Start(string deviceName, IntPtr hwnd, int width, int height) {
+            Stop();
+            try {
+                _hwnd = hwnd;
+                _graph   = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_FilterGraph));
+                _builder = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_CaptureGraphBuilder));
+                object devEnum = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_SystemDeviceEnum));
+
+                ((ICaptureGraphBuilder2)_builder).SetFiltergraph((IGraphBuilder)_graph);
+
+                Guid cat = CLSID_VideoInputDeviceCategory;
+                IEnumMoniker enumMon;
+                ((ICreateDevEnum)devEnum).CreateClassEnumerator(ref cat, out enumMon, 0);
+
+                if (enumMon != null) {
+                    IMoniker[] arr = new IMoniker[1];
+                    while (enumMon.Next(1, arr, IntPtr.Zero) == 0 && arr[0] != null) {
+                        bool matched = false;
+                        try {
+                            Guid bagIid = IID_IPropertyBag;
+                            object bagObj;
+                            arr[0].BindToStorage(null, null, ref bagIid, out bagObj);
+                            IPropertyBag bag = (IPropertyBag)bagObj;
+                            object friendly = null;
+                            bag.Read("FriendlyName", ref friendly, IntPtr.Zero);
+                            Marshal.ReleaseComObject(bag);
+                            string fn = friendly as string;
+                            if (fn != null && string.Equals(fn, deviceName, StringComparison.OrdinalIgnoreCase)) {
+                                Guid filterIid = IID_IBaseFilter;
+                                object filterObj;
+                                arr[0].BindToObject(null, null, ref filterIid, out filterObj);
+                                _filter = (IBaseFilter)filterObj;   // RCW делает QI(IBaseFilter) с правильным vtable
+                                matched = true;
+                            }
+                        } catch { }
+                        Marshal.ReleaseComObject(arr[0]);
+                        arr[0] = null;
+                        if (matched) break;
+                    }
+                    Marshal.ReleaseComObject(enumMon);
+                }
+                Marshal.ReleaseComObject(devEnum);
+
+                if (_filter == null) {
+                    throw new InvalidOperationException("Камера не найдена: " + deviceName);
+                }
+
+                ((IGraphBuilder)_graph).AddFilter(_filter, "Source");
+
+                Guid pinCat = PIN_CATEGORY_PREVIEW;
+                Guid mediaType = MEDIATYPE_Video;
+                int hr = ((ICaptureGraphBuilder2)_builder).RenderStream(pinCat, mediaType, _filter, null, null);
+                if (hr < 0) {
+                    pinCat = PIN_CATEGORY_CAPTURE;
+                    hr = ((ICaptureGraphBuilder2)_builder).RenderStream(pinCat, mediaType, _filter, null, null);
+                    if (hr < 0) {
+                        throw new InvalidOperationException("Не удалось построить граф предпросмотра (HRESULT 0x" + hr.ToString("X8") + ")");
+                    }
+                }
+
+                IVideoWindow vw = (IVideoWindow)_graph;
+                vw.put_Owner(hwnd);
+                vw.put_WindowStyle(WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS);
+                vw.SetWindowPosition(0, 0, width, height);
+                vw.put_Visible(OATRUE);
+
+                ((IMediaControl)_graph).Run();
+            } catch {
+                Stop();
+                throw;
+            }
+        }
+
+        public static void Resize(int width, int height) {
+            try {
+                if (_graph != null) {
+                    ((IVideoWindow)_graph).SetWindowPosition(0, 0, width, height);
+                }
+            } catch { }
+        }
+
+        public static void Stop() {
+            try { if (_graph != null) ((IMediaControl)_graph).Stop(); } catch { }
+            try {
+                if (_graph != null) {
+                    IVideoWindow vw = (IVideoWindow)_graph;
+                    vw.put_Visible(OAFALSE);
+                    vw.put_Owner(IntPtr.Zero);
+                }
+            } catch { }
+            if (_filter  != null) { try { Marshal.ReleaseComObject(_filter); } catch { } _filter = null; }
+            if (_builder != null) { try { Marshal.ReleaseComObject(_builder); } catch { } _builder = null; }
+            if (_graph   != null) { try { Marshal.ReleaseComObject(_graph); } catch { } _graph = null; }
+            _hwnd = IntPtr.Zero;
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Перечисление устройств
+# ═══════════════════════════════════════════════════════════════════════════════
+function Get-CameraList {
+    # Возвращаем имена видеовходов, которые отдаёт DirectShow System Device Enumerator —
+    # ровно то же, что показывает OBS (DroidCam, FIFINE, встроенная веб-камера, и т.д.).
+    # Виртуальные камеры (OBS Virtual Camera) намеренно НЕ скрываем, потому что OBS их тоже показывает.
+    $list = @()
+    try {
+        $list = @([GoodwinCam.CameraPreview]::EnumerateVideoDevices())
+    } catch {
+        Write-Log "Перечисление камер не удалось: $($_.Exception.Message)"
+    }
+    return $list | Where-Object { $_ } | Sort-Object -Unique
+}
+
+function Get-MicrophoneList {
+    # Подключённые микрофоны под именами, которые показывает OBS
+    # (через GoodwinCoreAudio.AudioMeter::EnumerateCaptureDevices()).
+    $list = @((Get-MicrophoneDeviceMap).Keys)
+    return $list | Where-Object { $_ } | Sort-Object -Unique
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI
+# ═══════════════════════════════════════════════════════════════════════════════
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# ── Состояние и загрузка сохранённых настроек ──────────────────────────────
+$script:SelectedCamera   = $null
+$script:SelectedMic      = $null
+$script:SelectedNickname = $null
+
+$loaded = Load-LocalSettings
+if ($loaded.ContainsKey('nickname'))      { $script:SelectedNickname = [string]$loaded['nickname'] }
+if ($loaded.ContainsKey('camera'))        { $script:SelectedCamera   = [string]$loaded['camera'] }
+if ($loaded.ContainsKey('mic'))           { $script:SelectedMic      = [string]$loaded['mic'] }
+if ($loaded.ContainsKey('recordingRoot') -and -not [string]::IsNullOrWhiteSpace([string]$loaded['recordingRoot'])) {
+    $script:RecordingRoot = [string]$loaded['recordingRoot']
+    $script:RecordingDir  = $script:RecordingRoot
+}
+if ([string]::IsNullOrWhiteSpace($script:SelectedNickname)) {
+    $script:SelectedNickname = 'untitled'
+}
+
+# ── Иконка приложения ──────────────────────────────────────────────────────
+# Сборка мультиразмерной .ico (16/24/32/48/64/128/256) из локально рисуемого
+# значка в стиле UI-иконок. Так приложение не зависит от внешних картинок.
+function New-AppIconBitmap {
+    param([Parameter(Mandatory = $true)][int] $Size)
+
+    $bmp = New-Object System.Drawing.Bitmap $Size, $Size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $bg = $null; $accent = $null; $pen = $null
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+
+        $s = [single]$Size
+        $radius = [single]($s * 0.22)
+        $rect = New-Object System.Drawing.RectangleF -ArgumentList 1.0, 1.0, ($s - 2.0), ($s - 2.0)
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        try {
+            $d = [single]($radius * 2.0)
+            $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
+            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
+            $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
+            $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
+            $path.CloseFigure()
+
+            $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+                $rect,
+                [System.Drawing.Color]::FromArgb(12, 74, 110),
+                [System.Drawing.Color]::FromArgb(20, 111, 60),
+                [System.Drawing.Drawing2D.LinearGradientMode]::ForwardDiagonal
+            )
+            $g.FillPath($bg, $path)
+        }
+        finally {
+            if ($path) { $path.Dispose() }
+        }
+
+        $accent = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(186, 230, 253))
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(186, 230, 253), [math]::Max(1.4, $s / 12.0))
+        $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+
+        $screen = New-Object System.Drawing.RectangleF -ArgumentList ($s*0.18), ($s*0.24), ($s*0.64), ($s*0.44)
+        $g.DrawRectangle($pen, $screen.X, $screen.Y, $screen.Width, $screen.Height)
+        $g.DrawLine($pen, $s*0.40, $s*0.80, $s*0.60, $s*0.80)
+        $g.DrawLine($pen, $s*0.50, $s*0.68, $s*0.50, $s*0.80)
+
+        $pts = @(
+            (New-Object System.Drawing.PointF -ArgumentList ($s*0.45), ($s*0.36)),
+            (New-Object System.Drawing.PointF -ArgumentList ($s*0.45), ($s*0.56)),
+            (New-Object System.Drawing.PointF -ArgumentList ($s*0.62), ($s*0.46))
+        )
+        $g.FillPolygon($accent, [System.Drawing.PointF[]]$pts)
+    }
+    finally {
+        if ($pen) { $pen.Dispose() }
+        if ($accent) { $accent.Dispose() }
+        if ($bg) { $bg.Dispose() }
+        if ($g) { $g.Dispose() }
+    }
+
+    return $bmp
+}
+
+function Get-AppIcon {
+    try {
+        $sizes = @(16, 24, 32, 48, 64, 128, 256)
+        $entries = @()
+        foreach ($sz in $sizes) {
+            $bmp = $null; $bms = $null
+            try {
+                $bmp = New-AppIconBitmap -Size $sz
+                $bms = New-Object IO.MemoryStream
+                $bmp.Save($bms, [System.Drawing.Imaging.ImageFormat]::Png)
+                $entries += [pscustomobject]@{ Size = $sz; Data = $bms.ToArray() }
+            }
+            finally {
+                if ($bmp) { $bmp.Dispose() }
+                if ($bms) { $bms.Dispose() }
+            }
+        }
+
+        $out = New-Object IO.MemoryStream
+        $bw  = New-Object IO.BinaryWriter($out)
+        try {
+            $bw.Write([uint16]0)
+            $bw.Write([uint16]1)
+            $bw.Write([uint16]$entries.Count)
+            $dataOffset = 6 + 16 * $entries.Count
+            foreach ($e in $entries) {
+                $dim = if ($e.Size -ge 256) { 0 } else { [byte]$e.Size }
+                $bw.Write([byte]$dim)
+                $bw.Write([byte]$dim)
+                $bw.Write([byte]0)
+                $bw.Write([byte]0)
+                $bw.Write([uint16]1)
+                $bw.Write([uint16]32)
+                $bw.Write([uint32]$e.Data.Length)
+                $bw.Write([uint32]$dataOffset)
+                $dataOffset += $e.Data.Length
+            }
+            foreach ($e in $entries) { $bw.Write($e.Data) }
+            $bw.Flush()
+            $icoBytes = $out.ToArray()
+        }
+        finally {
+            $bw.Close()
+        }
+
+        $icoMs = New-Object IO.MemoryStream (,$icoBytes)
+        return [System.Drawing.Icon]::new($icoMs)
+    }
+    catch {
+        Write-Log ('Не удалось собрать локальную иконку: ' + $_.Exception.Message)
+        return $null
+    }
+}
+$script:AppIcon = Get-AppIcon
+
+# ── Форма ──────────────────────────────────────────────────────────────────
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Goodwin OBS'
+if ($script:AppIcon) { $form.Icon = $script:AppIcon }
+$form.ClientSize = New-Object System.Drawing.Size(900, 344)
+$form.MinimumSize = New-Object System.Drawing.Size(920, 384)
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'FixedSingle'
+$form.MaximizeBox = $false
+$form.BackColor = [System.Drawing.Color]::FromArgb(14, 17, 22)
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+$colorBg       = [System.Drawing.Color]::FromArgb(14, 17, 22)
+$colorPanel    = [System.Drawing.Color]::FromArgb(25, 30, 39)
+$colorPanel2   = [System.Drawing.Color]::FromArgb(20, 24, 32)
+$colorInput    = [System.Drawing.Color]::FromArgb(31, 37, 48)
+$colorText     = [System.Drawing.Color]::FromArgb(238, 242, 247)
+$colorMuted    = [System.Drawing.Color]::FromArgb(154, 164, 178)
+$colorBorder   = [System.Drawing.Color]::FromArgb(50, 59, 74)
+$colorAccent   = [System.Drawing.Color]::FromArgb(56, 189, 248)
+$colorGreen    = [System.Drawing.Color]::FromArgb(34, 197, 94)
+$colorBlue     = [System.Drawing.Color]::FromArgb(59, 130, 246)
+$colorAmber    = [System.Drawing.Color]::FromArgb(245, 158, 11)
+$colorDanger   = [System.Drawing.Color]::FromArgb(239, 68, 68)
+$script:UiImages = New-Object System.Collections.Generic.List[object]
+$script:ToolTip = New-Object System.Windows.Forms.ToolTip
+$script:ToolTip.AutoPopDelay = 8000
+$script:ToolTip.InitialDelay = 350
+$script:ToolTip.ReshowDelay = 100
+
+function New-IconBitmap {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('brand','install','play','upload','folder','refresh','trash','edit','gear','mic','camera','logs')][string] $Kind,
+        [System.Drawing.Color] $Color = [System.Drawing.Color]::White,
+        [int] $Size = 22
+    )
+
+    $bmp = New-Object System.Drawing.Bitmap $Size, $Size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $pen = $null
+    $brush = $null
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $pen = New-Object System.Drawing.Pen($Color, [math]::Max(2.0, $Size / 11.0))
+        $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+        $brush = New-Object System.Drawing.SolidBrush($Color)
+
+        $s = [single]$Size
+        $u = {
+            param([double] $Value)
+            return [single]($s * $Value)
+        }
+        $pt = {
+            param([double] $X, [double] $Y)
+            return New-Object System.Drawing.PointF -ArgumentList (& $u $X), (& $u $Y)
+        }
+        $rect = {
+            param([double] $X, [double] $Y, [double] $W, [double] $H)
+            return New-Object System.Drawing.RectangleF -ArgumentList (& $u $X), (& $u $Y), (& $u $W), (& $u $H)
+        }
+
+        switch ($Kind) {
+            'brand' {
+                $r = & $rect 0.16 0.20 0.68 0.48
+                $g.DrawRectangle($pen, $r.X, $r.Y, $r.Width, $r.Height)
+                $g.DrawLine($pen, $s*0.40, $s*0.80, $s*0.60, $s*0.80)
+                $g.DrawLine($pen, $s*0.50, $s*0.68, $s*0.50, $s*0.80)
+                $pts = @(
+                    (& $pt 0.45 0.34),
+                    (& $pt 0.45 0.54),
+                    (& $pt 0.61 0.44)
+                )
+                $g.FillPolygon($brush, [System.Drawing.PointF[]]$pts)
+            }
+            'install' {
+                $g.DrawLine($pen, $s*0.50, $s*0.16, $s*0.50, $s*0.58)
+                $g.DrawLine($pen, $s*0.32, $s*0.42, $s*0.50, $s*0.60)
+                $g.DrawLine($pen, $s*0.68, $s*0.42, $s*0.50, $s*0.60)
+                $g.DrawLine($pen, $s*0.22, $s*0.78, $s*0.78, $s*0.78)
+                $g.DrawLine($pen, $s*0.22, $s*0.68, $s*0.22, $s*0.78)
+                $g.DrawLine($pen, $s*0.78, $s*0.68, $s*0.78, $s*0.78)
+            }
+            'play' {
+                $pts = @(
+                    (& $pt 0.32 0.22),
+                    (& $pt 0.32 0.78),
+                    (& $pt 0.78 0.50)
+                )
+                $g.FillPolygon($brush, [System.Drawing.PointF[]]$pts)
+            }
+            'upload' {
+                $g.DrawLine($pen, $s*0.50, $s*0.18, $s*0.50, $s*0.62)
+                $g.DrawLine($pen, $s*0.32, $s*0.36, $s*0.50, $s*0.18)
+                $g.DrawLine($pen, $s*0.68, $s*0.36, $s*0.50, $s*0.18)
+                $g.DrawLine($pen, $s*0.22, $s*0.70, $s*0.78, $s*0.70)
+                $g.DrawLine($pen, $s*0.22, $s*0.70, $s*0.22, $s*0.82)
+                $g.DrawLine($pen, $s*0.78, $s*0.70, $s*0.78, $s*0.82)
+                $g.DrawLine($pen, $s*0.22, $s*0.82, $s*0.78, $s*0.82)
+            }
+            'folder' {
+                $pts = @(
+                    (& $pt 0.14 0.30),
+                    (& $pt 0.36 0.30),
+                    (& $pt 0.44 0.40),
+                    (& $pt 0.86 0.40),
+                    (& $pt 0.86 0.78),
+                    (& $pt 0.14 0.78)
+                )
+                $g.DrawPolygon($pen, [System.Drawing.PointF[]]$pts)
+                $g.DrawLine($pen, $s*0.14, $s*0.48, $s*0.86, $s*0.48)
+            }
+            'refresh' {
+                $g.DrawArc($pen, $s*0.18, $s*0.18, $s*0.64, $s*0.64, 42, 282)
+                $head = @(
+                    (& $pt 0.82 0.22),
+                    (& $pt 0.82 0.48),
+                    (& $pt 0.62 0.34)
+                )
+                $g.FillPolygon($brush, [System.Drawing.PointF[]]$head)
+            }
+            'trash' {
+                $g.DrawLine($pen, $s*0.32, $s*0.26, $s*0.68, $s*0.26)
+                $g.DrawLine($pen, $s*0.42, $s*0.18, $s*0.58, $s*0.18)
+                $g.DrawRectangle($pen, $s*0.28, $s*0.34, $s*0.44, $s*0.46)
+                $g.DrawLine($pen, $s*0.42, $s*0.44, $s*0.42, $s*0.70)
+                $g.DrawLine($pen, $s*0.58, $s*0.44, $s*0.58, $s*0.70)
+            }
+            'edit' {
+                $g.DrawLine($pen, $s*0.24, $s*0.72, $s*0.66, $s*0.30)
+                $g.DrawLine($pen, $s*0.58, $s*0.22, $s*0.76, $s*0.40)
+                $g.DrawLine($pen, $s*0.20, $s*0.80, $s*0.38, $s*0.76)
+            }
+            'gear' {
+                $cx = [single]($s * 0.50)
+                $cy = [single]($s * 0.50)
+                for ($a = 0; $a -lt 360; $a += 45) {
+                    $rad = [Math]::PI * $a / 180.0
+                    $x1 = [single]($cx + [Math]::Cos($rad) * $s * 0.31)
+                    $y1 = [single]($cy + [Math]::Sin($rad) * $s * 0.31)
+                    $x2 = [single]($cx + [Math]::Cos($rad) * $s * 0.43)
+                    $y2 = [single]($cy + [Math]::Sin($rad) * $s * 0.43)
+                    $g.DrawLine($pen, $x1, $y1, $x2, $y2)
+                }
+                $g.DrawEllipse($pen, $s*0.25, $s*0.25, $s*0.50, $s*0.50)
+                $g.DrawEllipse($pen, $s*0.42, $s*0.42, $s*0.16, $s*0.16)
+            }
+            'mic' {
+                $g.DrawArc($pen, $s*0.38, $s*0.14, $s*0.24, $s*0.18, 180, 180)
+                $g.DrawLine($pen, $s*0.38, $s*0.23, $s*0.38, $s*0.48)
+                $g.DrawLine($pen, $s*0.62, $s*0.23, $s*0.62, $s*0.48)
+                $g.DrawArc($pen, $s*0.38, $s*0.39, $s*0.24, $s*0.18, 0, 180)
+                $g.DrawArc($pen, $s*0.24, $s*0.34, $s*0.52, $s*0.34, 0, 180)
+                $g.DrawLine($pen, $s*0.50, $s*0.70, $s*0.50, $s*0.84)
+                $g.DrawLine($pen, $s*0.36, $s*0.84, $s*0.64, $s*0.84)
+            }
+            'camera' {
+                $g.DrawRectangle($pen, $s*0.16, $s*0.28, $s*0.54, $s*0.44)
+                $pts = @(
+                    (& $pt 0.70 0.42),
+                    (& $pt 0.86 0.32),
+                    (& $pt 0.86 0.68),
+                    (& $pt 0.70 0.58)
+                )
+                $g.DrawPolygon($pen, [System.Drawing.PointF[]]$pts)
+            }
+            'logs' {
+                $g.DrawRectangle($pen, $s*0.24, $s*0.16, $s*0.52, $s*0.68)
+                $g.DrawLine($pen, $s*0.36, $s*0.34, $s*0.64, $s*0.34)
+                $g.DrawLine($pen, $s*0.36, $s*0.50, $s*0.64, $s*0.50)
+                $g.DrawLine($pen, $s*0.36, $s*0.66, $s*0.56, $s*0.66)
+            }
+        }
+    }
+    finally {
+        if ($pen) { $pen.Dispose() }
+        if ($brush) { $brush.Dispose() }
+        if ($g) { $g.Dispose() }
+    }
+    $script:UiImages.Add($bmp) | Out-Null
+    return $bmp
+}
+
+function New-PanelBlock {
+    param([int] $X, [int] $Y, [int] $W, [int] $H, [System.Drawing.Color] $Color = $colorPanel)
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Location = New-Object System.Drawing.Point($X, $Y)
+    $panel.Size = New-Object System.Drawing.Size($W, $H)
+    $panel.BackColor = $Color
+    $form.Controls.Add($panel)
+    return $panel
+}
+
+function New-UiLabel {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [string] $Text,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [int] $H = 20,
+        [bool] $Bold = $false,
+        [System.Drawing.Color] $Color = $colorMuted
+    )
+    $label = New-Object System.Windows.Forms.Label
+    $label.Location = New-Object System.Drawing.Point($X, $Y)
+    $label.Size = New-Object System.Drawing.Size($W, $H)
+    $label.ForeColor = $Color
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    $label.Text = $Text
+    $label.Font = New-Object System.Drawing.Font('Segoe UI', 9, $(if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
+    $Parent.Controls.Add($label)
+    return $label
+}
+
+function New-UiTextBox {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [string] $Text = '',
+        [bool] $ReadOnly = $false
+    )
+    $frame = New-Object System.Windows.Forms.Panel
+    $frame.Location = New-Object System.Drawing.Point($X, $Y)
+    $frame.Size = New-Object System.Drawing.Size($W, 30)
+    $frame.BackColor = [System.Drawing.Color]::Transparent
+
+    if ($ReadOnly) {
+        $txt = New-Object System.Windows.Forms.Label
+        $txt.Location = New-Object System.Drawing.Point(12, 5)
+        $txt.Size = New-Object System.Drawing.Size(([math]::Max(20, $W - 24)), 20)
+        $txt.TextAlign = 'MiddleLeft'
+        $txt.AutoEllipsis = $true
+        $txt.BackColor = [System.Drawing.Color]::Transparent
+        $txt.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 238)
+        $txt.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+        $txt.Text = $Text
+    } else {
+        $txt = New-Object System.Windows.Forms.TextBox
+        $txt.Location = New-Object System.Drawing.Point(12, 6)
+        $txt.Size = New-Object System.Drawing.Size(([math]::Max(20, $W - 24)), 22)
+        $txt.BackColor = [System.Drawing.Color]::FromArgb(24, 31, 42)
+        $txt.ForeColor = $colorText
+        $txt.BorderStyle = 'None'
+        $txt.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+        $txt.ReadOnly = $false
+        $txt.Text = $Text
+    }
+    $frame.Controls.Add($txt)
+    $Parent.Controls.Add($frame)
+    Set-UiTextFieldStyle -Frame $frame -TextBox $txt -ReadOnly $ReadOnly
+    return $txt
+}
+
+function Get-ShiftedColor {
+    param([System.Drawing.Color] $Color, [int] $Delta)
+    return [System.Drawing.Color]::FromArgb(
+        $Color.A,
+        [math]::Min(255, [math]::Max(0, $Color.R + $Delta)),
+        [math]::Min(255, [math]::Max(0, $Color.G + $Delta)),
+        [math]::Min(255, [math]::Max(0, $Color.B + $Delta))
+    )
+}
+
+function New-RoundedRectPath {
+    param([System.Drawing.Rectangle] $Rect, [int] $Radius)
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $diameter = [math]::Max(2, $Radius * 2)
+    $arc = New-Object System.Drawing.Rectangle -ArgumentList $Rect.X, $Rect.Y, $diameter, $diameter
+    $path.AddArc($arc, 180, 90)
+    $arc.X = $Rect.Right - $diameter
+    $path.AddArc($arc, 270, 90)
+    $arc.Y = $Rect.Bottom - $diameter
+    $path.AddArc($arc, 0, 90)
+    $arc.X = $Rect.X
+    $path.AddArc($arc, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+function Paint-GoodwinTextField {
+    param([System.Windows.Forms.Panel] $Frame, [System.Windows.Forms.PaintEventArgs] $EventArgs)
+    $style = $Frame.Tag
+    if (-not $style -or $style.FieldStyle -ne 'GoodwinTextField') { return }
+
+    $g = $EventArgs.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+
+    $parentColor = if ($Frame.Parent) { $Frame.Parent.BackColor } else { $colorPanel }
+    $g.Clear($parentColor)
+
+    $rect = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, ([int]($Frame.Width - 1)), ([int]($Frame.Height - 1))
+    $bg = $style.BackColor
+    $border = $style.BorderColor
+    if (-not $Frame.Enabled) {
+        $bg = $style.DisabledBackColor
+        $border = $style.DisabledBorderColor
+    } elseif ($style.State -eq 'Focus') {
+        $border = $style.FocusBorderColor
+    } elseif ($style.State -eq 'Hover') {
+        $bg = $style.HoverBackColor
+        $border = $style.HoverBorderColor
+    }
+
+    $path = New-RoundedRectPath $rect $style.Radius
+    $brush = New-Object System.Drawing.SolidBrush($bg)
+    $pen = New-Object System.Drawing.Pen($border, 1)
+    try {
+        $g.FillPath($brush, $path)
+        $g.DrawPath($pen, $path)
+    }
+    finally {
+        $pen.Dispose()
+        $brush.Dispose()
+        $path.Dispose()
+    }
+}
+
+function Set-UiTextFieldStyle {
+    param(
+        [System.Windows.Forms.Panel] $Frame,
+        [System.Windows.Forms.Control] $TextBox,
+        [bool] $ReadOnly
+    )
+    $baseBack = [System.Drawing.Color]::FromArgb(24, 31, 42)
+    $Frame.Tag = [pscustomobject]@{
+        FieldStyle          = 'GoodwinTextField'
+        State               = 'Normal'
+        Radius              = 8
+        BackColor           = $baseBack
+        HoverBackColor      = [System.Drawing.Color]::FromArgb(28, 36, 49)
+        DisabledBackColor   = [System.Drawing.Color]::FromArgb(23, 27, 35)
+        BorderColor         = [System.Drawing.Color]::FromArgb(58, 70, 88)
+        HoverBorderColor    = [System.Drawing.Color]::FromArgb(80, 96, 120)
+        FocusBorderColor    = [System.Drawing.Color]::FromArgb(56, 189, 248)
+        DisabledBorderColor = [System.Drawing.Color]::FromArgb(43, 50, 62)
+    }
+    $TextBox.BackColor = if ($TextBox -is [System.Windows.Forms.Label]) { [System.Drawing.Color]::Transparent } else { $baseBack }
+    $TextBox.ForeColor = if ($ReadOnly) { [System.Drawing.Color]::FromArgb(218, 226, 238) } else { $colorText }
+    if ($TextBox -is [System.Windows.Forms.TextBox]) { $TextBox.ReadOnly = $ReadOnly }
+
+    $enter = {
+        if ($this -is [System.Windows.Forms.TextBox] -or $this -is [System.Windows.Forms.Label]) { $target = $this.Parent } else { $target = $this }
+        if ($target.Tag -and $target.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $target.Tag.State = 'Hover'
+            $target.Invalidate()
+        }
+    }
+    $leave = {
+        if ($this -is [System.Windows.Forms.TextBox] -or $this -is [System.Windows.Forms.Label]) { $target = $this.Parent } else { $target = $this }
+        if ($target.Tag -and $target.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $target.Tag.State = 'Normal'
+            $target.Invalidate()
+        }
+    }
+    $focus = {
+        if ($this.Parent.Tag -and $this.Parent.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $this.Parent.Tag.State = 'Focus'
+            $this.Parent.Invalidate()
+        }
+    }
+    $blur = {
+        if ($this.Parent.Tag -and $this.Parent.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $this.Parent.Tag.State = 'Normal'
+            $this.Parent.Invalidate()
+        }
+    }
+
+    $Frame.Add_Paint({ param($sender, $e) Paint-GoodwinTextField $sender $e })
+    $Frame.Add_MouseEnter($enter)
+    $Frame.Add_MouseLeave($leave)
+    $TextBox.Add_MouseEnter($enter)
+    $TextBox.Add_MouseLeave($leave)
+    if ($TextBox -is [System.Windows.Forms.TextBox]) {
+        $TextBox.Add_Enter($focus)
+        $TextBox.Add_Leave($blur)
+    }
+    $Frame.Add_EnabledChanged({
+        if ($this.Tag -and $this.Tag.FieldStyle -eq 'GoodwinTextField') {
+            $this.Tag.State = 'Normal'
+            $this.Invalidate()
+        }
+    })
+}
+
+function Paint-GoodwinButton {
+    param([System.Windows.Forms.Button] $Button, [System.Windows.Forms.PaintEventArgs] $EventArgs)
+    $style = $Button.Tag
+    if (-not $style -or $style.ButtonStyle -ne 'Goodwin') { return }
+
+    $g = $EventArgs.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+
+    $parentColor = if ($Button.Parent) { $Button.Parent.BackColor } else { $colorBg }
+    $g.Clear($parentColor)
+
+    $rect = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, ([int]($Button.Width - 1)), ([int]($Button.Height - 1))
+    $bg = $style.BaseColor
+    if (-not $Button.Enabled) {
+        $bg = $style.DisabledColor
+    } elseif ($style.State -eq 'Pressed') {
+        $bg = $style.PressedColor
+    } elseif ($style.State -eq 'Hover') {
+        $bg = $style.HoverColor
+    }
+
+    $path = New-RoundedRectPath $rect $style.Radius
+    $brush = New-Object System.Drawing.SolidBrush($bg)
+    $borderPen = New-Object System.Drawing.Pen($(if ($Button.Enabled) { $style.BorderColor } else { $style.DisabledBorderColor }), 1)
+    try {
+        $g.FillPath($brush, $path)
+        if ($style.HighlightAlpha -gt 0 -and $Button.Enabled) {
+            $highlightRect = New-Object System.Drawing.Rectangle -ArgumentList 1, 1, ([int]($Button.Width - 2)), ([int]([math]::Max(1, [int]($Button.Height / 2))))
+            $highlightPath = New-RoundedRectPath $highlightRect ([math]::Max(2, $style.Radius - 1))
+            $highlightBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($style.HighlightAlpha, 255, 255, 255))
+            try { $g.FillPath($highlightBrush, $highlightPath) }
+            finally {
+                $highlightBrush.Dispose()
+                $highlightPath.Dispose()
+            }
+        }
+        $g.DrawPath($borderPen, $path)
+
+        if ($Button.Enabled -and $style.BlinkActive) {
+            $pulse = if ($null -ne $script:BlinkPulse) { [double]$script:BlinkPulse } else { 0.0 }
+            $blinkBase = $style.BlinkBorderColor
+            $glowAlpha = [int](55 + (120 * $pulse))
+            $lineAlpha = [int](150 + (105 * $pulse))
+            $glowColor = [System.Drawing.Color]::FromArgb($glowAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
+            $blinkColor = [System.Drawing.Color]::FromArgb($lineAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
+            $glowRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
+            $glowPath = New-RoundedRectPath $glowRect ([math]::Max(2, $style.Radius - 1))
+            $glowPen = New-Object System.Drawing.Pen($glowColor, ([single](5.0 + (2.0 * $pulse))))
+            try { $g.DrawPath($glowPen, $glowPath) }
+            finally {
+                $glowPen.Dispose()
+                $glowPath.Dispose()
+            }
+
+            $blinkRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
+            $blinkPath = New-RoundedRectPath $blinkRect ([math]::Max(2, $style.Radius - 1))
+            $blinkPen = New-Object System.Drawing.Pen($blinkColor, ([single](2.8 + (1.4 * $pulse))))
+            try { $g.DrawPath($blinkPen, $blinkPath) }
+            finally {
+                $blinkPen.Dispose()
+                $blinkPath.Dispose()
+            }
+        }
+
+        $textColor = if ($Button.Enabled) { $style.ForeColor } else { $style.DisabledForeColor }
+        $hasText = -not [string]::IsNullOrWhiteSpace($Button.Text)
+        $textSize = if ($hasText) {
+            [System.Windows.Forms.TextRenderer]::MeasureText($Button.Text, $Button.Font)
+        } else {
+            New-Object System.Drawing.Size -ArgumentList 0, 0
+        }
+        $gap = if ($Button.Image -and $hasText) { 9 } else { 0 }
+        $iconW = if ($Button.Image) { $Button.Image.Width } else { 0 }
+        $totalW = $iconW + $gap + $textSize.Width
+        $startX = if ($hasText) {
+            [math]::Max(12, [int](($Button.Width - $totalW) / 2))
+        } else {
+            [int](($Button.Width - $totalW) / 2)
+        }
+
+        if ($Button.Image) {
+            $iconY = [int](($Button.Height - $Button.Image.Height) / 2)
+            $iconRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, $iconY, $Button.Image.Width, $Button.Image.Height
+            $g.DrawImage($Button.Image, $iconRect)
+            $startX += $Button.Image.Width + $gap
+        }
+
+        if ($hasText) {
+            $textRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, 0, ([int]([math]::Max(20, $Button.Width - $startX - 12))), $Button.Height
+            $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
+                     [System.Windows.Forms.TextFormatFlags]::Left -bor
+                     [System.Windows.Forms.TextFormatFlags]::SingleLine -bor
+                     [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $Button.Text, $Button.Font, $textRect, $textColor, $flags)
+        }
+    }
+    finally {
+        $borderPen.Dispose()
+        $brush.Dispose()
+        $path.Dispose()
+    }
+}
+
+function Set-UiButtonStyle {
+    param(
+        [System.Windows.Forms.Button] $Button,
+        [System.Drawing.Color] $Color,
+        [System.Drawing.Color] $HoverColor,
+        [System.Drawing.Color] $ForeColor = $colorText,
+        [bool] $Bold = $false,
+        [int] $Radius = 9,
+        [System.Drawing.Color] $BorderColor = ([System.Drawing.Color]::FromArgb(78, 91, 112)),
+        [int] $HighlightAlpha = 18
+    )
+    $Button.FlatStyle = 'Flat'
+    $Button.FlatAppearance.BorderSize = 0
+    $Button.FlatAppearance.MouseOverBackColor = $Color
+    $Button.FlatAppearance.MouseDownBackColor = $Color
+    $Button.BackColor = $Color
+    $Button.ForeColor = $ForeColor
+    $Button.UseVisualStyleBackColor = $false
+    $Button.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, $(if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $Button.Tag = [pscustomobject]@{
+        ButtonStyle         = 'Goodwin'
+        BaseColor           = $Color
+        HoverColor          = $HoverColor
+        PressedColor        = (Get-ShiftedColor $HoverColor -20)
+        DisabledColor       = [System.Drawing.Color]::FromArgb(32, 38, 49)
+        ForeColor           = $ForeColor
+        DisabledForeColor   = [System.Drawing.Color]::FromArgb(120, 130, 145)
+        BorderColor         = $BorderColor
+        DisabledBorderColor = [System.Drawing.Color]::FromArgb(46, 54, 68)
+        Radius              = $Radius
+        HighlightAlpha      = $HighlightAlpha
+        State               = 'Normal'
+        BlinkActive         = $false
+        BlinkBorderColor    = (Get-ShiftedColor $HoverColor 74)
+    }
+    $Button.Add_MouseEnter({
+        if ($this.Enabled -and $this.Tag -and $this.Tag.ButtonStyle -eq 'Goodwin') {
+            $this.Tag.State = 'Hover'
+            $this.Invalidate()
+        }
+    })
+    $Button.Add_MouseLeave({
+        if ($this.Tag -and $this.Tag.ButtonStyle -eq 'Goodwin') {
+            $this.Tag.State = 'Normal'
+            $this.Invalidate()
+        }
+    })
+    $Button.Add_MouseDown({
+        if ($this.Enabled -and $this.Tag -and $this.Tag.ButtonStyle -eq 'Goodwin') {
+            $this.Tag.State = 'Pressed'
+            $this.Invalidate()
+        }
+    })
+    $Button.Add_MouseUp({
+        if ($this.Enabled -and $this.Tag -and $this.Tag.ButtonStyle -eq 'Goodwin') {
+            $this.Tag.State = if ($this.ClientRectangle.Contains($this.PointToClient([System.Windows.Forms.Cursor]::Position))) { 'Hover' } else { 'Normal' }
+            $this.Invalidate()
+        }
+    })
+    $Button.Add_EnabledChanged({
+        if ($this.Tag -and $this.Tag.ButtonStyle -eq 'Goodwin') {
+            $this.Tag.State = 'Normal'
+            $this.Invalidate()
+        }
+    })
+    $Button.Add_Paint({ param($sender, $e) Paint-GoodwinButton $sender $e })
+}
+
+function Set-ButtonIcon {
+    param(
+        [System.Windows.Forms.Button] $Button,
+        [string] $Kind,
+        [System.Drawing.Color] $Color = [System.Drawing.Color]::White
+    )
+    $Button.Image = New-IconBitmap -Kind $Kind -Color $Color -Size 20
+    $Button.ImageAlign = 'MiddleLeft'
+    $Button.TextAlign = 'MiddleCenter'
+    $Button.TextImageRelation = 'ImageBeforeText'
+    $Button.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
+}
+
+function New-IconBadge {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [string] $Kind,
+        [int] $X,
+        [int] $Y,
+        [System.Drawing.Color] $BackColor,
+        [System.Drawing.Color] $IconColor = [System.Drawing.Color]::White,
+        [int] $Size = 40,
+        [int] $IconSize = 22
+    )
+    $box = New-Object System.Windows.Forms.PictureBox
+    $box.Location = New-Object System.Drawing.Point($X, $Y)
+    $box.Size = New-Object System.Drawing.Size($Size, $Size)
+    $box.BackColor = $BackColor
+    $box.SizeMode = 'CenterImage'
+    $box.Image = New-IconBitmap -Kind $Kind -Color $IconColor -Size $IconSize
+    $Parent.Controls.Add($box)
+    return $box
+}
+
+function New-UtilityButton {
+    param([System.Windows.Forms.Control] $Parent, [string] $Text, [int] $X, [int] $Y, [int] $W = 92)
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Location = New-Object System.Drawing.Point($X, $Y)
+    $btn.Size = New-Object System.Drawing.Size($W, 30)
+    $btn.Text = $Text
+    Set-UiButtonStyle -Button $btn -Color ([System.Drawing.Color]::FromArgb(34, 41, 54)) -HoverColor ([System.Drawing.Color]::FromArgb(48, 58, 74)) -ForeColor ([System.Drawing.Color]::FromArgb(226, 232, 240)) -Radius 8 -BorderColor ([System.Drawing.Color]::FromArgb(70, 82, 100)) -HighlightAlpha 10
+    $Parent.Controls.Add($btn)
+    return $btn
+}
+
+function New-InnerPanel {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [int] $H,
+        [System.Drawing.Color] $Color
+    )
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Location = New-Object System.Drawing.Point($X, $Y)
+    $panel.Size = New-Object System.Drawing.Size($W, $H)
+    $panel.BackColor = $Color
+    $Parent.Controls.Add($panel)
+    return $panel
+}
+
+function New-InfoCard {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [string] $Title,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [int] $H,
+        [System.Drawing.Color] $Accent
+    )
+    $card = New-InnerPanel $Parent $X $Y $W $H ([System.Drawing.Color]::FromArgb(24, 30, 40))
+    $stripe = New-Object System.Windows.Forms.Panel
+    $stripe.Location = New-Object System.Drawing.Point(0, 0)
+    $stripe.Size = New-Object System.Drawing.Size(4, $H)
+    $stripe.BackColor = $Accent
+    $card.Controls.Add($stripe)
+    [void](New-UiLabel $card $Title 16 12 ($W - 32) 18 $true $colorMuted)
+    return $card
+}
+
+function New-CompactInfoCard {
+    param(
+        [System.Windows.Forms.Control] $Parent,
+        [string] $Title,
+        [int] $X,
+        [int] $Y,
+        [int] $W,
+        [System.Drawing.Color] $Accent
+    )
+    $card = New-InnerPanel $Parent $X $Y $W 44 ([System.Drawing.Color]::FromArgb(24, 30, 40))
+    $stripe = New-Object System.Windows.Forms.Panel
+    $stripe.Location = New-Object System.Drawing.Point(0, 0)
+    $stripe.Size = New-Object System.Drawing.Size(3, 44)
+    $stripe.BackColor = $Accent
+    $card.Controls.Add($stripe)
+
+    $titleLabel = New-UiLabel $card $Title 12 5 ($W - 22) 14 $true $colorMuted
+    $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI', 7.5, [System.Drawing.FontStyle]::Bold)
+
+    $stateLabel = New-UiLabel $card '' 12 21 ($W - 22) 18 $true $colorText
+    $stateLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5, [System.Drawing.FontStyle]::Bold)
+    $stateLabel.AutoEllipsis = $true
+
+    return [pscustomobject]@{
+        Card       = $card
+        StateLabel = $stateLabel
+    }
+}
+
+# === Шапка ===
+$headerPanel = New-PanelBlock 0 0 900 76 ([System.Drawing.Color]::FromArgb(17, 22, 31))
+$brandBadge = New-IconBadge $headerPanel 'brand' 24 12 ([System.Drawing.Color]::FromArgb(12, 74, 110)) ([System.Drawing.Color]::FromArgb(186, 230, 253)) 54 30
+
+$lblTitle = New-UiLabel $headerPanel 'Goodwin OBS' 92 11 250 34 $true $colorText
+$lblTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 19, [System.Drawing.FontStyle]::Bold)
+$lblSubtitle = New-UiLabel $headerPanel 'OBS SETUP' 94 48 180 18 $false $colorMuted
+$lblSubtitle.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+
+# === Краткое состояние ===
+$quickStatusPanel = New-InnerPanel $headerPanel 342 11 534 54 $colorPanel2
+$nickMini = New-CompactInfoCard $quickStatusPanel 'НИК' 10 5 150 $colorAccent
+$script:NickStateLabel_ref = $nickMini.StateLabel
+
+$dropboxMini = New-CompactInfoCard $quickStatusPanel 'DROPBOX' 170 5 126 $colorBlue
+$script:DropboxStateLabel_ref = $dropboxMini.StateLabel
+
+$obsMini = New-CompactInfoCard $quickStatusPanel 'OBS' 306 5 88 $colorGreen
+$script:ObsStateLabel_ref = $obsMini.StateLabel
+
+$uploadMini = New-CompactInfoCard $quickStatusPanel 'ЗАГРУЗКА' 404 5 120 $colorAmber
+$script:UploadStateLabel_ref = $uploadMini.StateLabel
+
+# === Параметры ===
+$settingsPanel = New-PanelBlock 24 88 852 74 $colorPanel
+
+$lblPath = New-UiLabel $settingsPanel 'Путь записи' 18 10 150
+$txtPath = New-UiTextBox $settingsPanel 18 32 350 $script:RecordingRoot $true
+$script:ToolTip.SetToolTip($txtPath, 'Изменить папку записи')
+$script:ToolTip.SetToolTip($txtPath.Parent, 'Изменить папку записи')
+
+$lblMic = New-UiLabel $settingsPanel 'Микрофон' 390 10 150
+$txtMicSel = New-UiTextBox $settingsPanel 390 32 190 $(if ($script:SelectedMic) { $script:SelectedMic } else { 'Авто' }) $true
+$script:ToolTip.SetToolTip($txtMicSel, 'Выбрать микрофон')
+$script:ToolTip.SetToolTip($txtMicSel.Parent, 'Выбрать микрофон')
+
+$lblCam = New-UiLabel $settingsPanel 'Камера' 602 10 150
+$txtCamSel = New-UiTextBox $settingsPanel 602 32 232 $(if ($script:SelectedCamera) { $script:SelectedCamera } else { 'Авто' }) $true
+$script:ToolTip.SetToolTip($txtCamSel, 'Выбрать камеру')
+$script:ToolTip.SetToolTip($txtCamSel.Parent, 'Выбрать камеру')
+
+# === Статус ===
+$statusPanel = New-PanelBlock 24 174 852 34 ([System.Drawing.Color]::FromArgb(18, 23, 31))
+$statusAccent = New-Object System.Windows.Forms.Panel
+$statusAccent.Location = New-Object System.Drawing.Point(0, 0)
+$statusAccent.Size = New-Object System.Drawing.Size(4, 34)
+$statusAccent.BackColor = $colorAccent
+$statusPanel.Controls.Add($statusAccent)
+
+$lblStatus = New-Object System.Windows.Forms.Label
+$lblStatus.Location = New-Object System.Drawing.Point(16, 7)
+$lblStatus.Size     = New-Object System.Drawing.Size(816, 20)
+$lblStatus.ForeColor = $colorMuted
+$lblStatus.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$lblStatus.Text = 'Готов к установке'
+$statusPanel.Controls.Add($lblStatus)
+$script:StatusLabel_ref = $lblStatus
+
+# === Основные кнопки ===
+function New-MainButton {
+    param(
+        [string] $Text,
+        [int] $X,
+        [int] $Y,
+        [System.Drawing.Color] $Color,
+        [System.Drawing.Color] $HoverColor,
+        [bool] $Enabled = $true
+    )
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Location = New-Object System.Drawing.Point($X, $Y)
+    $btn.Size     = New-Object System.Drawing.Size(270, 50)
+    $btn.Text = $Text
+    Set-UiButtonStyle -Button $btn -Color $Color -HoverColor $HoverColor -ForeColor ([System.Drawing.Color]::White) -Bold $true -Radius 11 -BorderColor (Get-ShiftedColor $HoverColor 18) -HighlightAlpha 24
+    $btn.Enabled = $Enabled
+    if (-not $Enabled) { $btn.Invalidate() }
+    $form.Controls.Add($btn)
+    return $btn
+}
+
+function New-SecondaryButton {
+    param([string] $Text, [int] $X, [int] $Y, [int] $W = 312)
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Location = New-Object System.Drawing.Point($X, $Y)
+    $btn.Size     = New-Object System.Drawing.Size($W, 38)
+    $btn.Text = $Text
+    Set-UiButtonStyle -Button $btn -Color ([System.Drawing.Color]::FromArgb(30, 37, 49)) -HoverColor ([System.Drawing.Color]::FromArgb(43, 52, 68)) -ForeColor ([System.Drawing.Color]::FromArgb(226, 232, 240)) -Radius 10 -BorderColor ([System.Drawing.Color]::FromArgb(62, 74, 92)) -HighlightAlpha 12
+    $form.Controls.Add($btn)
+    return $btn
+}
+
+$btnInstall = New-MainButton 'Установить OBS' 24  224  ([System.Drawing.Color]::FromArgb(20, 111, 60))  ([System.Drawing.Color]::FromArgb(27, 143, 76))
+$btnLaunch  = New-MainButton 'Запустить OBS'  315 224  ([System.Drawing.Color]::FromArgb(31, 82, 154))  ([System.Drawing.Color]::FromArgb(43, 105, 196)) $false
+$btnUpload  = New-MainButton 'Загрузить запись' 606 224 ([System.Drawing.Color]::FromArgb(145, 88, 22)) ([System.Drawing.Color]::FromArgb(181, 110, 25))
+Set-ButtonIcon -Button $btnInstall -Kind 'install'
+Set-ButtonIcon -Button $btnLaunch -Kind 'play'
+Set-ButtonIcon -Button $btnUpload -Kind 'upload'
+
+# === Вспомогательные кнопки ===
+$btnFolder = New-SecondaryButton 'Папка записей'    24  292 198
+$btnFresh  = New-SecondaryButton 'Чистая установка' 242 292 198
+$btnClean  = New-SecondaryButton 'Очистить'         460 292 198
+$btnLogs   = New-SecondaryButton 'Логи'             678 292 198
+Set-ButtonIcon -Button $btnFolder -Kind 'folder' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
+Set-ButtonIcon -Button $btnFresh -Kind 'refresh' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
+Set-ButtonIcon -Button $btnClean -Kind 'trash' -Color ([System.Drawing.Color]::FromArgb(248, 113, 113))
+Set-ButtonIcon -Button $btnLogs -Kind 'logs' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
+
+function Set-Status {
+    param([string] $Text, [string] $Color = 'Gray')
+    $map = @{
+        Gray   = @(154,164,178)
+        Green  = @(74,222,128)
+        Red    = @(248,113,113)
+        Yellow = @(251,191,36)
+    }
+    $c = $map[$Color]
+    $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb($c[0], $c[1], $c[2])
+    $statusAccent.BackColor = $lblStatus.ForeColor
+    $lblStatus.Text = $Text
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Update-OverviewState {
+    $nick = if ([string]::IsNullOrWhiteSpace($script:SelectedNickname) -or $script:SelectedNickname -eq 'untitled') {
+        'Не указан'
+    } else {
+        $script:SelectedNickname
+    }
+    if ($script:NickStateLabel_ref) { $script:NickStateLabel_ref.Text = Format-UiText $nick 18 }
+    if ($script:NickHintLabel_ref) {
+        $script:NickHintLabel_ref.Text = if ($nick -eq 'Не указан') {
+            'Будет запрошен перед запуском OBS'
+        } else {
+            'Будет использован в имени записи'
+        }
+    }
+
+    if ($script:DropboxStateLabel_ref) {
+        $script:DropboxStateLabel_ref.Text = if ($script:DropboxAccessState) { $script:DropboxAccessState } else { 'Не проверен' }
+    }
+
+    $obsExe = Join-Path $InstallDir 'bin\64bit\obs64.exe'
+    if ($script:ObsStateLabel_ref) {
+        $script:ObsStateLabel_ref.Text = if (Test-Path -LiteralPath $obsExe) { 'Готов' } else { 'Не установлен' }
+    }
+    if ($script:ObsHintLabel_ref) {
+        $script:ObsHintLabel_ref.Text = if (Test-Path -LiteralPath $obsExe) {
+            'Можно запускать запись'
+        } else {
+            'Нажмите «Установить OBS»'
+        }
+    }
+
+    if ($script:UploadStateLabel_ref -and -not $script:IsUploading) {
+        $script:UploadStateLabel_ref.Text = if ($script:HasNewRecording) { 'Новая запись' } else { 'Нет новых' }
+    }
+    if ($script:UploadHintLabel_ref -and -not $script:IsUploading) {
+        $script:UploadHintLabel_ref.Text = if ($script:HasNewRecording) { 'Можно загружать в Dropbox' } else { 'Новых записей нет' }
+    }
+}
+
+function Enable-Button  {
+    param($b)
+    $b.Enabled = $true
+    if ($b.Tag -and $b.Tag.ButtonStyle -eq 'Goodwin') {
+        $b.BackColor = $b.Tag.BaseColor
+        $b.ForeColor = $b.Tag.ForeColor
+        $b.Invalidate()
+    } elseif ($b.Tag) {
+        $b.BackColor = [System.Drawing.Color]::FromArgb([int]$b.Tag)
+        $b.ForeColor = $colorText
+    } else {
+        $b.BackColor = $colorBlue
+        $b.ForeColor = $colorText
+    }
+}
+function Disable-Button {
+    param($b)
+    $b.Enabled = $false
+    if ($b.Tag -and $b.Tag.ButtonStyle -eq 'Goodwin') {
+        $b.BackColor = $b.Tag.DisabledColor
+        $b.ForeColor = $b.Tag.DisabledForeColor
+        $b.Invalidate()
+    } else {
+        $b.BackColor = [System.Drawing.Color]::FromArgb(33, 38, 48)
+        $b.ForeColor = [System.Drawing.Color]::FromArgb(118, 128, 142)
+    }
+}
+
+function Test-PortableObsReady {
+    return (Test-Path -LiteralPath (Join-Path $InstallDir 'bin\64bit\obs64.exe'))
+}
+
+function Set-ButtonBlink {
+    param($Button, [bool] $Active)
+    if (-not $Button -or -not $Button.Tag -or $Button.Tag.ButtonStyle -ne 'Goodwin') { return }
+    $changed = ($Button.Tag.BlinkActive -ne $Active)
+    $Button.Tag.BlinkActive = $Active
+    if ($changed -or $Active) { $Button.Invalidate() }
+}
+
+function Get-RecordingFileSnapshot {
+    $snapshot = @{}
+    try {
+        if ([string]::IsNullOrWhiteSpace($script:RecordingRoot) -or -not (Test-Path -LiteralPath $script:RecordingRoot)) {
+            return $snapshot
+        }
+        $patterns = @('*.mp4','*.mkv','*.mov','*.flv')
+        $files = @(Get-ChildItem -Path (Join-Path $script:RecordingRoot '*') -File -Include $patterns -ErrorAction SilentlyContinue)
+        foreach ($file in $files) {
+            if ($file.Length -le 0) { continue }
+            $snapshot[$file.FullName] = "{0}|{1}" -f $file.Length, $file.LastWriteTimeUtc.Ticks
+        }
+    }
+    catch {
+        Write-Log ('Не удалось прочитать папку записей: ' + $_.Exception.Message)
+    }
+    return $snapshot
+}
+
+function Reset-RecordingMonitor {
+    $script:RecordingFileSnapshot = Get-RecordingFileSnapshot
+    $script:HasNewRecording = $false
+    if ($script:UploadStateLabel_ref -and -not $script:IsUploading) { $script:UploadStateLabel_ref.Text = 'Нет новых' }
+    if ($script:UploadHintLabel_ref -and -not $script:IsUploading) { $script:UploadHintLabel_ref.Text = 'Новых записей нет' }
+}
+
+function Scan-RecordingFolderForNewFiles {
+    $current = Get-RecordingFileSnapshot
+    if ($null -eq $script:RecordingFileSnapshot) {
+        $script:RecordingFileSnapshot = $current
+        return
+    }
+
+    foreach ($path in $current.Keys) {
+        if (-not $script:RecordingFileSnapshot.ContainsKey($path)) {
+            if (-not $script:HasNewRecording) {
+                Write-Step ('Найдена новая запись: ' + [IO.Path]::GetFileName($path))
+            }
+            $script:HasNewRecording = $true
+            if ($script:UploadStateLabel_ref -and -not $script:IsUploading) { $script:UploadStateLabel_ref.Text = 'Новая запись' }
+            if ($script:UploadHintLabel_ref -and -not $script:IsUploading) { $script:UploadHintLabel_ref.Text = 'Можно загружать в Dropbox' }
+            return
+        }
+    }
+}
+
+function Update-BlinkTargets {
+    $obsReady = Test-PortableObsReady
+    if (-not $obsReady) { $script:ObsLaunchCompleted = $false }
+    $allowBlink = (-not $script:IsBusy)
+    Set-ButtonBlink $btnInstall ($allowBlink -and -not $obsReady)
+    Set-ButtonBlink $btnLaunch  ($allowBlink -and $obsReady -and -not $script:ObsLaunchCompleted)
+    Set-ButtonBlink $btnUpload  ($allowBlink -and $script:HasNewRecording -and -not $script:IsUploading)
+}
+
+if (Test-Path -LiteralPath (Join-Path $InstallDir 'bin\64bit\obs64.exe')) {
+    Enable-Button $btnLaunch
+}
+
+function Set-AuxControlsEnabled {
+    # Включает/выключает второстепенные элементы (выбор устройств, путь записи,
+    # «Открыть папку») на время длительной операции — чтобы их нельзя было
+    # дёрнуть и устроить гонку с установкой/распаковкой.
+    param([bool] $Enabled)
+    foreach ($c in @($txtCamSel, $txtCamSel.Parent, $txtMicSel, $txtMicSel.Parent, $txtPath, $txtPath.Parent, $btnFolder)) {
+        if ($c) { $c.Enabled = $Enabled }
+    }
+}
+
+Reset-RecordingMonitor
+Update-OverviewState
+
+$script:ObsLaunchCompleted = $false
+$script:BlinkPulse = 0.0
+$script:BlinkStartTicks = [Environment]::TickCount
+$script:LastRecordingScanUtc = [DateTime]::MinValue
+$script:StateTimer = New-Object System.Windows.Forms.Timer
+$script:StateTimer.Interval = 50
+$script:StateTimer.Add_Tick({
+    try {
+        $elapsedMs = [Environment]::TickCount - $script:BlinkStartTicks
+        $script:BlinkPulse = ([Math]::Sin((2.0 * [Math]::PI * $elapsedMs) / 1600.0) + 1.0) / 2.0
+        $now = [DateTime]::UtcNow
+        if (($now - $script:LastRecordingScanUtc).TotalSeconds -ge 2) {
+            $script:LastRecordingScanUtc = $now
+            Scan-RecordingFolderForNewFiles
+            Update-OverviewState
+        }
+        Update-BlinkTargets
+    }
+    catch {
+        Write-Log ('Ошибка таймера состояния: ' + $_.Exception.Message)
+    }
+})
+$script:StateTimer.Start()
+
+$script:StartupDropboxCheckStarted = $false
+$form.Add_Shown({
+    if ($script:StartupDropboxCheckStarted) { return }
+    $script:StartupDropboxCheckStarted = $true
+
+    $script:StartupDropboxCheckTimer = New-Object System.Windows.Forms.Timer
+    $script:StartupDropboxCheckTimer.Interval = 250
+    $script:StartupDropboxCheckTimer.Add_Tick({
+        param($sender, $eventArgs)
+        try {
+            $sender.Stop()
+            $sender.Dispose()
+            Write-Step 'Проверяем доступ к Dropbox'
+            if (Test-DropboxAccess) {
+                Write-Step 'Доступ к Dropbox подтверждён'
+            } else {
+                Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
+            }
+            Update-OverviewState
+        }
+        catch {
+            Set-DropboxAccessState 'Ошибка'
+            Write-ErrorDetails -Context 'Стартовая проверка Dropbox' -ErrorRecord $_
+        }
+    })
+    $script:StartupDropboxCheckTimer.Start()
+})
+
+# ── Диалог выбора камеры (отдельное окно с кнопкой предпросмотра) ──────────
+function Show-CameraSelectionDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Выбор камеры'
+    $dlg.Size = New-Object System.Drawing.Size(720, 570)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = 'Камера:'
+    $l.Location = New-Object System.Drawing.Point(12, 18)
+    $l.Size     = New-Object System.Drawing.Size(70, 20)
+    $l.ForeColor = $colorText
+    $dlg.Controls.Add($l)
+
+    $cmb = New-Object System.Windows.Forms.ComboBox
+    $cmb.Location = New-Object System.Drawing.Point(85, 14)
+    $cmb.Size     = New-Object System.Drawing.Size(500, 25)
+    $cmb.DropDownStyle = 'DropDownList'
+    $cmb.BackColor = $colorInput
+    $cmb.ForeColor = $colorText
+    $cmb.Items.Add('Авто') | Out-Null
+    $camList = @(Get-CameraList)
+    foreach ($c in $camList) { $cmb.Items.Add($c) | Out-Null }
+    if ($camList.Count -eq 0) { Write-Step 'Камеры не обнаружены — проверьте подключение и доступ к камере в параметрах конфиденциальности Windows.' }
+    if ($script:SelectedCamera -and $cmb.Items.Contains($script:SelectedCamera)) {
+        $cmb.SelectedItem = $script:SelectedCamera
+    } else {
+        $cmb.SelectedIndex = 0
+    }
+    $dlg.Controls.Add($cmb)
+
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Location = New-Object System.Drawing.Point(595, 13)
+    $btnRefresh.Size     = New-Object System.Drawing.Size(95, 27)
+    $btnRefresh.Text = 'Обновить'
+    Set-UiButtonStyle -Button $btnRefresh -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnRefresh)
+
+    # Панель-контейнер для DirectShow VideoWindow
+    $pnlPreview = New-Object System.Windows.Forms.Panel
+    $pnlPreview.Location = New-Object System.Drawing.Point(12, 52)
+    $pnlPreview.Size     = New-Object System.Drawing.Size(678, 410)
+    $pnlPreview.BackColor = [System.Drawing.Color]::FromArgb(9, 12, 18)
+    $pnlPreview.BorderStyle = 'FixedSingle'
+    $dlg.Controls.Add($pnlPreview)
+
+    $lblHint = New-Object System.Windows.Forms.Label
+    $lblHint.Text = 'Выберите камеру для предпросмотра'
+    $lblHint.Location = New-Object System.Drawing.Point(0, 190)
+    $lblHint.Size = New-Object System.Drawing.Size(678, 30)
+    $lblHint.TextAlign = 'MiddleCenter'
+    $lblHint.ForeColor = $colorMuted
+    $lblHint.BackColor = [System.Drawing.Color]::Transparent
+    $pnlPreview.Controls.Add($lblHint)
+
+    $startPreview = {
+        param([string] $deviceName)
+        try {
+            [GoodwinCam.CameraPreview]::Start($deviceName, $pnlPreview.Handle, $pnlPreview.ClientSize.Width, $pnlPreview.ClientSize.Height)
+            $lblHint.Visible = $false
+        } catch {
+            $lblHint.Text = "Не удалось показать предпросмотр:`r`n$($_.Exception.Message)"
+            $lblHint.Visible = $true
+        }
+    }
+
+    $stopPreview = {
+        try { [GoodwinCam.CameraPreview]::Stop() } catch {}
+    }
+
+    $cmb.Add_SelectedIndexChanged({
+        & $stopPreview
+        if ($cmb.SelectedIndex -gt 0) {
+            $lblHint.Text = 'Запуск предпросмотра…'
+            $lblHint.Visible = $true
+            [System.Windows.Forms.Application]::DoEvents()
+            & $startPreview ([string]$cmb.SelectedItem)
+        } else {
+            $lblHint.Text = 'Выберите камеру для предпросмотра'
+            $lblHint.Visible = $true
+        }
+    })
+
+    $btnRefresh.Add_Click({
+        & $stopPreview
+        $current = if ($cmb.SelectedIndex -gt 0) { [string]$cmb.SelectedItem } else { $null }
+        $cmb.Items.Clear()
+        $cmb.Items.Add('Авто') | Out-Null
+        foreach ($c in (Get-CameraList)) { $cmb.Items.Add($c) | Out-Null }
+        if ($current -and $cmb.Items.Contains($current)) {
+            $cmb.SelectedItem = $current
+        } else {
+            $cmb.SelectedIndex = 0
+        }
+    })
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'OK'
+    $btnOk.Location = New-Object System.Drawing.Point(504, 478)
+    $btnOk.Size     = New-Object System.Drawing.Size(80, 32)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Отменить'
+    $btnCancel.Location = New-Object System.Drawing.Point(594, 478)
+    $btnCancel.Size     = New-Object System.Drawing.Size(96, 32)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+
+    $dlg.Add_Shown({
+        if ($cmb.SelectedIndex -gt 0) {
+            & $startPreview ([string]$cmb.SelectedItem)
+        }
+    })
+    $dlg.Add_FormClosing({ & $stopPreview })
+
+    if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        if ($cmb.SelectedIndex -le 0) {
+            $script:SelectedCamera = $null
+            $txtCamSel.Text = 'Авто'
+        } else {
+            $script:SelectedCamera = [string]$cmb.SelectedItem
+            $txtCamSel.Text = $script:SelectedCamera
+        }
+        Save-CurrentSettings
+        Write-Step "Выбрана камера: $(if($script:SelectedCamera){$script:SelectedCamera}else{'Авто'})"
+    }
+    $dlg.Dispose()
+}
+
+# ── Диалог выбора микрофона (отдельное окно с полоской уровня и Прослушать) ─
+function Show-MicrophoneSelectionDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Выбор микрофона'
+    $dlg.Size = New-Object System.Drawing.Size(560, 280)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = 'Микрофон:'
+    $l.Location = New-Object System.Drawing.Point(12, 18)
+    $l.Size     = New-Object System.Drawing.Size(80, 20)
+    $l.ForeColor = $colorText
+    $dlg.Controls.Add($l)
+
+    $cmb = New-Object System.Windows.Forms.ComboBox
+    $cmb.Location = New-Object System.Drawing.Point(95, 14)
+    $cmb.Size     = New-Object System.Drawing.Size(440, 25)
+    $cmb.DropDownStyle = 'DropDownList'
+    $cmb.BackColor = $colorInput
+    $cmb.ForeColor = $colorText
+    $cmb.Items.Add('Авто') | Out-Null
+    $micList = @(Get-MicrophoneList)
+    foreach ($m in $micList) { $cmb.Items.Add($m) | Out-Null }
+    if ($micList.Count -eq 0) { Write-Step 'Микрофоны не обнаружены — проверьте подключение и доступ к микрофону в параметрах конфиденциальности Windows.' }
+    if ($script:SelectedMic -and $cmb.Items.Contains($script:SelectedMic)) {
+        $cmb.SelectedItem = $script:SelectedMic
+    } else {
+        $cmb.SelectedIndex = 0
+    }
+    $dlg.Controls.Add($cmb)
+
+    $lblLevel = New-Object System.Windows.Forms.Label
+    $lblLevel.Text = 'Уровень сигнала:'
+    $lblLevel.Location = New-Object System.Drawing.Point(12, 56)
+    $lblLevel.Size     = New-Object System.Drawing.Size(150, 20)
+    $lblLevel.ForeColor = $colorText
+    $dlg.Controls.Add($lblLevel)
+
+    $pnlLevel = New-Object System.Windows.Forms.Panel
+    $pnlLevel.Location = New-Object System.Drawing.Point(12, 80)
+    $pnlLevel.Size     = New-Object System.Drawing.Size(523, 24)
+    $pnlLevel.BackColor = $colorInput
+    $pnlLevel.BorderStyle = 'FixedSingle'
+    $dlg.Controls.Add($pnlLevel)
+
+    $script:DlgMicLevel = 0.0
+    $pnlLevel.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $w = $s.ClientSize.Width
+        $h = $s.ClientSize.Height
+        $level = [math]::Min(1.0, [math]::Max(0.0, [double]$script:DlgMicLevel))
+        $filled = [int]($w * $level)
+        if ($filled -le 0) { return }
+        $greenEnd  = [int]($w * 0.60)
+        $yellowEnd = [int]($w * 0.85)
+        $brushG = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(80, 200, 80))
+        $brushY = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(220, 200, 60))
+        $brushR = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(220, 80, 80))
+        try {
+            $gFill = [math]::Min($filled, $greenEnd)
+            if ($gFill -gt 0) { $g.FillRectangle($brushG, 0, 0, $gFill, $h) }
+            if ($filled -gt $greenEnd) {
+                $yFill = [math]::Min($filled, $yellowEnd) - $greenEnd
+                if ($yFill -gt 0) { $g.FillRectangle($brushY, $greenEnd, 0, $yFill, $h) }
+            }
+            if ($filled -gt $yellowEnd) {
+                $rFill = $filled - $yellowEnd
+                if ($rFill -gt 0) { $g.FillRectangle($brushR, $yellowEnd, 0, $rFill, $h) }
+            }
+        } finally {
+            $brushG.Dispose(); $brushY.Dispose(); $brushR.Dispose()
+        }
+    })
+
+    $btnListen = New-Object System.Windows.Forms.Button
+    $btnListen.Location = New-Object System.Drawing.Point(12, 120)
+    $btnListen.Size     = New-Object System.Drawing.Size(200, 36)
+    $btnListen.Text = 'Прослушать (3 сек)'
+    Set-UiButtonStyle -Button $btnListen -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnListen)
+
+    $lblHint = New-Object System.Windows.Forms.Label
+    $lblHint.Text = "Запись использует микрофон, выбранный в Windows по умолчанию.`nЧтобы протестировать другой — задайте его «По умолчанию» в настройках звука."
+    $lblHint.Location = New-Object System.Drawing.Point(220, 122)
+    $lblHint.Size     = New-Object System.Drawing.Size(315, 36)
+    $lblHint.ForeColor = $colorMuted
+    $dlg.Controls.Add($lblHint)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'OK'
+    $btnOk.Location = New-Object System.Drawing.Point(336, 195)
+    $btnOk.Size     = New-Object System.Drawing.Size(86, 30)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Отменить'
+    $btnCancel.Location = New-Object System.Drawing.Point(432, 195)
+    $btnCancel.Size     = New-Object System.Drawing.Size(104, 30)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+
+    # Кэш разрешённого устройства, чтобы не перечислять все микрофоны на каждый тик.
+    $script:DlgMicCachedName = $null
+    $script:DlgMicCachedId   = $null
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 80
+    $timer.Add_Tick({
+        try {
+            $peak = 0.0
+            if ($cmb.SelectedIndex -le 0) {
+                $peak = [double][GoodwinCoreAudio.AudioMeter]::GetDefaultCapturePeak()
+            } else {
+                $name = [string]$cmb.SelectedItem
+                # Разрешаем id один раз — пока выбор не сменился (раньше перебор шёл каждый тик).
+                if ($name -ne $script:DlgMicCachedName) {
+                    $script:DlgMicCachedName = $name
+                    $script:DlgMicCachedId   = Get-MicrophoneDeviceIdByName -FriendlyName $name
+                }
+                if ($script:DlgMicCachedId -and $script:DlgMicCachedId -ne 'default') {
+                    $peak = [double][GoodwinCoreAudio.AudioMeter]::GetPeakById($script:DlgMicCachedId)
+                } else {
+                    $peak = [double][GoodwinCoreAudio.AudioMeter]::GetPeakByName($name)
+                }
+            }
+            $script:DlgMicLevel = $peak
+        } catch {
+            $script:DlgMicLevel = 0.0
+        }
+        $pnlLevel.Invalidate()
+    })
+
+    $btnListen.Add_Click({
+        $btnListen.Enabled = $false
+        $orig = $btnListen.Text
+        $btnListen.Text = 'Запись… 3 сек'
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            Start-MicrophoneTest -DurationSec 3
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Не удалось записать/воспроизвести: $($_.Exception.Message)", 'Ошибка', 'OK', 'Error') | Out-Null
+        }
+        $btnListen.Text = $orig
+        $btnListen.Enabled = $true
+    })
+
+    $dlg.Add_Shown({ $timer.Start() })
+    $dlg.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
+
+    if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        if ($cmb.SelectedIndex -le 0) {
+            $script:SelectedMic = $null
+            $txtMicSel.Text = 'Авто'
+        } else {
+            $script:SelectedMic = [string]$cmb.SelectedItem
+            $txtMicSel.Text = $script:SelectedMic
+        }
+        Save-CurrentSettings
+        Write-Step "Выбран микрофон: $(if($script:SelectedMic){$script:SelectedMic}else{'Авто'})"
+    }
+    $dlg.Dispose()
+}
+
+function Set-SettingsFieldClick {
+    param(
+        [System.Windows.Forms.Control] $Field,
+        [scriptblock] $Action
+    )
+    foreach ($target in @($Field, $Field.Parent)) {
+        if (-not $target) { continue }
+        $target.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $target.Add_Click($Action)
+    }
+}
+
+# ── Обработчики выбора устройств / пути / никнейма ─────────────────────────
+$openCameraSettings = {
+    if ($script:IsBusy) { return }
+    try { Show-CameraSelectionDialog }
+    catch { Write-ErrorDetails -Context 'Выбор камеры' -ErrorRecord $_ }
+}
+Set-SettingsFieldClick $txtCamSel $openCameraSettings
+
+$openMicrophoneSettings = {
+    if ($script:IsBusy) { return }
+    try { Show-MicrophoneSelectionDialog }
+    catch { Write-ErrorDetails -Context 'Выбор микрофона' -ErrorRecord $_ }
+}
+Set-SettingsFieldClick $txtMicSel $openMicrophoneSettings
+
+function Sanitize-Nickname {
+    param([string] $Value)
+    $raw = if ($Value) { $Value.Trim() } else { '' }
+    $cleaned = $raw -replace '[<>:"/\\|?*]', ''
+    $cleaned = $cleaned -replace '\s+', '_'
+    if ([string]::IsNullOrWhiteSpace($cleaned)) { $cleaned = 'untitled' }
+    return $cleaned
+}
+
+function Set-SelectedNickname {
+    param([string] $Nickname)
+    $cleaned = Sanitize-Nickname $Nickname
+    $script:SelectedNickname = $cleaned
+    Save-CurrentSettings
+    Update-OverviewState
+    Write-Step "Ник записи: $script:SelectedNickname"
+    return $cleaned
+}
+
+function Show-NicknameDialog {
+    param(
+        [string] $Title = 'Ник записи',
+        [string] $Prompt = 'Введите никнейм, который будет добавлен в имя файлов записи.'
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $Title
+    $dlg.Size = New-Object System.Drawing.Size(460, 220)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    if ($script:AppIcon) { $dlg.Icon = $script:AppIcon }
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Prompt
+    $label.Location = New-Object System.Drawing.Point(18, 18)
+    $label.Size = New-Object System.Drawing.Size(404, 38)
+    $label.ForeColor = $colorText
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($label)
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Location = New-Object System.Drawing.Point(18, 68)
+    $txt.Size = New-Object System.Drawing.Size(404, 30)
+    $txt.BackColor = $colorInput
+    $txt.ForeColor = $colorText
+    $txt.BorderStyle = 'FixedSingle'
+    $txt.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+    $txt.Text = if ($script:SelectedNickname -and $script:SelectedNickname -ne 'untitled') { $script:SelectedNickname } else { '' }
+    $dlg.Controls.Add($txt)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = 'Недопустимые символы будут удалены, пробелы заменятся на _.'
+    $hint.Location = New-Object System.Drawing.Point(18, 104)
+    $hint.Size = New-Object System.Drawing.Size(404, 20)
+    $hint.ForeColor = $colorMuted
+    $hint.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($hint)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'Продолжить'
+    $btnOk.Location = New-Object System.Drawing.Point(226, 136)
+    $btnOk.Size = New-Object System.Drawing.Size(96, 32)
+    Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Отмена'
+    $btnCancel.Location = New-Object System.Drawing.Point(328, 136)
+    $btnCancel.Size = New-Object System.Drawing.Size(94, 32)
+    Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
+    $dlg.Controls.Add($btnCancel)
+
+    $btnOk.Add_Click({
+        $cleaned = Sanitize-Nickname $txt.Text
+        if ($cleaned -eq 'untitled') {
+            [System.Windows.Forms.MessageBox]::Show(
+                'Введите никнейм перед запуском OBS.',
+                'Ник не указан',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+        if ($cleaned -ne $txt.Text.Trim()) { $txt.Text = $cleaned }
+        $dlg.Tag = $cleaned
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dlg.Close()
+    })
+    $btnCancel.Add_Click({
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $dlg.Close()
+    })
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+    $dlg.Add_Shown({ $txt.Focus(); $txt.SelectAll() })
+
+    try {
+        if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            return (Set-SelectedNickname ([string]$dlg.Tag))
+        }
+        return $null
+    }
+    finally {
+        $dlg.Dispose()
+    }
+}
+
+function Show-LogViewerDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Логи Goodwin OBS'
+    $dlg.Size = New-Object System.Drawing.Size(900, 620)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    if ($script:AppIcon) { $dlg.Icon = $script:AppIcon }
+
+    $pathLabel = New-Object System.Windows.Forms.Label
+    $pathLabel.Text = $script:LogFile
+    $pathLabel.Location = New-Object System.Drawing.Point(16, 14)
+    $pathLabel.Size = New-Object System.Drawing.Size(850, 20)
+    $pathLabel.ForeColor = $colorMuted
+    $pathLabel.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($pathLabel)
+
+    $box = New-Object System.Windows.Forms.RichTextBox
+    $box.Location = New-Object System.Drawing.Point(16, 42)
+    $box.Size = New-Object System.Drawing.Size(850, 468)
+    $box.ReadOnly = $true
+    $box.BackColor = [System.Drawing.Color]::FromArgb(9, 12, 18)
+    $box.ForeColor = [System.Drawing.Color]::FromArgb(220, 226, 235)
+    $box.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $box.ScrollBars = 'Both'
+    $box.WordWrap = $false
+    $box.BorderStyle = 'FixedSingle'
+    $dlg.Controls.Add($box)
+
+    $loadLog = {
+        try {
+            if (Test-Path -LiteralPath $script:LogFile) {
+                $box.Text = Get-Content -Raw -Path $script:LogFile -Encoding UTF8
+            } else {
+                $box.Text = 'Лог-файл пока не создан.'
+            }
+            $box.SelectionStart = $box.TextLength
+            try { $box.ScrollToCaret() } catch {}
+        }
+        catch {
+            $box.Text = 'Не удалось прочитать лог: ' + $_.Exception.Message
+        }
+    }
+
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Text = 'Обновить'
+    $btnRefresh.Location = New-Object System.Drawing.Point(542, 526)
+    $btnRefresh.Size = New-Object System.Drawing.Size(100, 32)
+    Set-UiButtonStyle -Button $btnRefresh -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnRefresh)
+
+    $btnOpen = New-Object System.Windows.Forms.Button
+    $btnOpen.Text = 'Открыть файл'
+    $btnOpen.Location = New-Object System.Drawing.Point(648, 526)
+    $btnOpen.Size = New-Object System.Drawing.Size(110, 32)
+    Set-UiButtonStyle -Button $btnOpen -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnOpen)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = 'Закрыть'
+    $btnClose.Location = New-Object System.Drawing.Point(764, 526)
+    $btnClose.Size = New-Object System.Drawing.Size(102, 32)
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    Set-UiButtonStyle -Button $btnClose -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnClose)
+
+    $btnRefresh.Add_Click({ & $loadLog })
+    $btnOpen.Add_Click({
+        try {
+            if (-not (Test-Path -LiteralPath $script:LogFile)) {
+                Add-LogFileLine ("[{0}] Лог-файл создан по запросу пользователя." -f (Get-Date -Format 'HH:mm:ss'))
+            }
+            Start-Process -FilePath notepad.exe -ArgumentList $script:LogFile
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                ('Не удалось открыть лог-файл: ' + $_.Exception.Message),
+                'Логи',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+    })
+
+    & $loadLog
+    [void]$dlg.ShowDialog($form)
+    $dlg.Dispose()
+}
+
+$openRecordingFolderSettings = {
+    if ($script:IsBusy) { return }
+    try {
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        $fbd.Description = 'Выберите папку для записей'
+        if (Test-Path $script:RecordingRoot) { $fbd.SelectedPath = $script:RecordingRoot }
+        if ($fbd.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            $script:RecordingRoot = $fbd.SelectedPath
+            $script:RecordingDir  = $script:RecordingRoot
+            $txtPath.Text = $script:RecordingRoot
+            Save-CurrentSettings
+            Reset-RecordingMonitor
+            Update-OverviewState
+            Write-Step "Папка записей изменена: $script:RecordingRoot"
+        }
+    }
+    catch { Write-ErrorDetails -Context 'Выбор папки записей' -ErrorRecord $_ }
+}
+Set-SettingsFieldClick $txtPath $openRecordingFolderSettings
+
+# ── Проверка доступности выбранных устройств ───────────────────────────────
+function Confirm-DeviceAvailability {
+    # Возвращает $true, если можно продолжать установку, $false — если пользователь отказался.
+    $warnings = @()
+
+    if ($script:SelectedMic) {
+        $mics = @(Get-MicrophoneList)
+        if ($mics -notcontains $script:SelectedMic) {
+            $warnings += "Микрофон «$script:SelectedMic» не подключён или отключён."
+        }
+    }
+    if ($script:SelectedCamera) {
+        $cams = @(Get-CameraList)
+        if ($cams -notcontains $script:SelectedCamera) {
+            $warnings += "Камера «$script:SelectedCamera» не подключена или отключена."
+        }
+    }
+
+    if ($warnings.Count -eq 0) { return $true }
+
+    $msg = ($warnings -join "`r`n") + "`r`n`r`nПродолжить установку? OBS будет использовать устройство по умолчанию."
+    $res = [System.Windows.Forms.MessageBox]::Show(
+        $msg,
+        'Устройство недоступно',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    return ($res -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
+# ── Кнопка «Установить» ────────────────────────────────────────────────────
+$btnInstall.Add_Click({
+    if ($script:IsBusy) { return }
+
+    if ([string]::IsNullOrWhiteSpace($script:SelectedNickname)) {
+        $script:SelectedNickname = 'untitled'
+    }
+    Save-CurrentSettings
+    Update-OverviewState
+
+    if (-not (Confirm-DeviceAvailability)) {
+        Set-Status 'Установка отменена: устройство недоступно.' 'Yellow'
+        return
+    }
+
+    $script:IsBusy = $true
+    Set-AuxControlsEnabled $false
+    Disable-Button $btnInstall
+    Set-Status 'Установка OBS...' 'Yellow'
+    try {
+        Ensure-Tls12
+        New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
+        Install-ObsPortable
+        Install-PortableSettings
+
+        Write-Step 'Проверяем доступ к Dropbox'
+        if (Test-DropboxAccess) {
+            Write-Step '✓ Доступ к Dropbox подтверждён'
+        } else {
+            Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
+        }
+
+        Set-Status 'OBS установлен. Нажмите «Запустить».' 'Green'
+        $script:ObsLaunchCompleted = $false
+        Enable-Button $btnLaunch
+        Update-OverviewState
+    }
+    catch {
+        Write-ErrorDetails -Context 'Установка OBS' -ErrorRecord $_
+        Set-Status ('Ошибка установки: ' + $_.Exception.Message) 'Red'
+    }
+    finally {
+        $script:IsBusy = $false
+        Set-AuxControlsEnabled $true
+        Enable-Button $btnInstall
+    }
+})
+
+# ── Кнопка «Запустить» ─────────────────────────────────────────────────────
+$btnLaunch.Add_Click({
+    if ($script:IsBusy) { return }
+
+    $nickname = Show-NicknameDialog
+    if ([string]::IsNullOrWhiteSpace($nickname)) {
+        Set-Status 'Запуск отменён: ник не указан.' 'Yellow'
+        return
+    }
+
+    $script:IsBusy = $true
+    Disable-Button $btnLaunch
+    Set-Status 'Применяем настройки OBS...' 'Yellow'
+    try {
+        $obsRunning = Get-Process -Name 'obs64' -ErrorAction SilentlyContinue
+        if ($obsRunning) {
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "OBS уже запущен. Чтобы стартовать портативную версию, нужно закрыть текущий процесс.`n`n" +
+                "ВНИМАНИЕ: если в OBS идёт запись или стрим, они прервутся, несохранённые изменения могут пропасть.`n`n" +
+                "Закрыть запущенный OBS?",
+                'OBS уже запущен',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Step 'Запуск отменён пользователем (OBS уже работает).'
+                Set-Status 'Запуск отменён.' 'Yellow'
+                return
+            }
+            Write-Step 'Закрываем запущенный OBS по согласию пользователя'
+            $obsRunning | Stop-Process -Force
+            Start-Sleep -Seconds 2
+        }
+        Set-PortableObsConfig
+        Set-Status 'Запускаем OBS...' 'Yellow'
+        Start-PortableObs
+        $script:ObsLaunchCompleted = $true
+        Set-ButtonBlink $btnLaunch $false
+        Set-Status 'OBS запущен. После записи нажмите «Загрузить».' 'Green'
+        Enable-Button $btnUpload
+        Update-OverviewState
+    }
+    catch {
+        Write-ErrorDetails -Context 'Запуск OBS' -ErrorRecord $_
+        Set-Status ('Ошибка запуска: ' + $_.Exception.Message) 'Red'
+    }
+    finally {
+        $script:IsBusy = $false
+        Enable-Button $btnLaunch
+    }
+})
+
+# ── Кнопка «Загрузить» (выбор файлов по префиксу никнейма) ─────────────────
+$btnUpload.Add_Click({
+    if ($script:IsBusy) { return }
+
+    $cleaned = Sanitize-Nickname $script:SelectedNickname
+    if ($cleaned -eq 'untitled') {
+        $cleaned = Show-NicknameDialog -Title 'Ник записей' -Prompt 'Введите никнейм, по которому будут выбраны файлы записи.'
+        if ([string]::IsNullOrWhiteSpace($cleaned)) {
+            Set-Status 'Загрузка отменена: ник не указан.' 'Yellow'
+            return
+        }
+    } else {
+        $script:SelectedNickname = $cleaned
+        Save-CurrentSettings
+        Update-OverviewState
+    }
+    $prefix = $cleaned
+
+    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+    $ofd.Title = "Выберите записи с префиксом «$prefix»"
+    if (Test-Path $script:RecordingRoot) { $ofd.InitialDirectory = $script:RecordingRoot }
+    $ofd.Multiselect = $true
+    # Жёсткий фильтр — только файлы с правильным префиксом, без «Все файлы»
+    $patterns = "${prefix}*.mp4;${prefix}*.mkv;${prefix}*.mov;${prefix}*.flv"
+    $ofd.Filter = "Записи «$prefix» ($patterns)|$patterns"
+
+    if ($ofd.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+        Write-Step 'Загрузка отменена пользователем.'
+        return
+    }
+
+    # Двойная защита: даже если бы пользователь ввёл путь вручную, отсеиваем не подходящие
+    $selectedPaths = @($ofd.FileNames | Where-Object {
+        [IO.Path]::GetFileName($_).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    })
+
+    if ($selectedPaths.Count -eq 0) {
+        Set-Status "Не выбраны файлы с префиксом «$prefix»." 'Yellow'
+        return
+    }
+
+    $filesToUpload = @($selectedPaths |
+        ForEach-Object { Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue } |
+        Where-Object { $_ -and $_.Length -gt 0 })
+
+    if ($filesToUpload.Count -eq 0) {
+        Set-Status 'Выбранные файлы недоступны или пусты.' 'Red'
+        return
+    }
+
+    # ── Дедуп: отсекаем то, что уже загружено (по локальному логу + по Dropbox)
+    Write-Step 'Проверяем, какие файлы уже загружены…'
+    $history = Load-UploadHistory
+    $skipped = @()
+    $pending = @()
+    $remoteToken = $null
+    try {
+        $remoteToken = Get-DropboxAccessToken
+    } catch {
+        Write-Log "Не удалось получить access token для дедупа: $($_.Exception.Message)"
+    }
+    foreach ($f in $filesToUpload) {
+        $key = Get-FileDedupSignature -Path $f.FullName
+        $alreadyLocal  = $key -and $history.ContainsKey($key)
+        $alreadyRemote = $false
+        if (-not $alreadyLocal -and $remoteToken) {
+            $alreadyRemote = Test-UploadedOnDropbox -AccessToken $remoteToken -File $f -Size $f.Length -Path $f.FullName
+            if ($alreadyRemote) {
+                # Записываем в локальный лог, чтобы в следующий раз не дёргать Dropbox
+                Add-UploadHistoryEntry -Key $key -File $f -DropboxId $null -DropboxPath (Get-DropboxUploadPath -File $f)
+                $history = Load-UploadHistory
+            }
+        }
+        if ($alreadyLocal -or $alreadyRemote) {
+            $reason = if ($alreadyLocal) { 'локально' } else { 'в Dropbox' }
+            Write-Log "Пропуск дубля ($reason): $($f.Name)"
+            $skipped += $f
+        } else {
+            $pending += [pscustomobject]@{ File = $f; Key = $key }
+        }
+    }
+    if ($skipped.Count -gt 0) {
+        Write-Step ("Пропущено уже загруженных: {0}" -f $skipped.Count)
+    }
+    $filesToUpload = @($pending | ForEach-Object { $_.File })
+    if ($filesToUpload.Count -eq 0) {
+        Set-Status 'Все выбранные файлы уже загружены ранее.' 'Green'
+        Write-Step '✓ Новых файлов для загрузки нет.'
+        return
+    }
+    # Передадим $pending в Upload-RecordedFiles через скриптовый словарь — там по File берётся Key
+    $script:UploadDedupKeys = @{}
+    foreach ($p in $pending) { $script:UploadDedupKeys[$p.File.FullName] = $p.Key }
+
+    $script:IsBusy = $true
+    Set-AuxControlsEnabled $false
+    Disable-Button $btnUpload
+    Disable-Button $btnInstall
+    Disable-Button $btnLaunch
+    Disable-Button $btnFresh
+    Disable-Button $btnClean
+    $script:IsUploading = $true
+    $form.Text = '⚠ ЗАГРУЗКА — НЕ ЗАКРЫВАЙТЕ!'
+    Set-Status '⚠ НЕ ЗАКРЫВАЙТЕ ОКНО! Идёт загрузка записей...' 'Yellow'
+    if ($script:UploadStateLabel_ref) { $script:UploadStateLabel_ref.Text = 'Загрузка' }
+    if ($script:UploadHintLabel_ref) { $script:UploadHintLabel_ref.Text = "Файлов: $($filesToUpload.Count)" }
+
+    Write-Step 'Не закрывайте окно до конца загрузки. Загрузка может занять от 10 до 60 минут.'
+
+    try {
+        $uploadStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Upload-RecordedFiles -Files $filesToUpload
+        $uploadStopwatch.Stop()
+
+        $elapsed = $uploadStopwatch.Elapsed
+        $elapsedStr = '{0:00}:{1:00}:{2:00}' -f $elapsed.Hours, $elapsed.Minutes, $elapsed.Seconds
+        Write-Step "Время загрузки: $elapsedStr"
+
+        Reset-RecordingMonitor
+        Set-Status '✓ Все записи успешно загружены!' 'Green'
+        if ($script:UploadStateLabel_ref) { $script:UploadStateLabel_ref.Text = 'Загружено' }
+        if ($script:UploadHintLabel_ref) { $script:UploadHintLabel_ref.Text = "Время загрузки: $elapsedStr" }
+        Write-Step 'Готово!'
+    }
+    catch {
+        Clear-UploadProgress
+        Write-ErrorDetails -Context 'Загрузка записей' -ErrorRecord $_
+        Set-Status 'Ошибка загрузки. Можно нажать повторно.' 'Red'
+        if ($script:UploadStateLabel_ref) { $script:UploadStateLabel_ref.Text = 'Ошибка загрузки' }
+        if ($script:UploadHintLabel_ref) { $script:UploadHintLabel_ref.Text = 'Подробности доступны через кнопку «Логи»' }
+    }
+    finally {
+        $script:IsUploading = $false
+        $script:IsBusy = $false
+        Set-AuxControlsEnabled $true
+        $form.Text = 'Goodwin OBS'
+        Enable-Button $btnUpload
+        Enable-Button $btnInstall
+        Enable-Button $btnLaunch
+        Enable-Button $btnFresh
+        Enable-Button $btnClean
+        if (Test-Path $TempRoot) {
+            Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $InstallDir) {
+            $delConfirm = [System.Windows.Forms.MessageBox]::Show(
+                "Удалить портативную копию OBS?`n($InstallDir)`n`nЕсли планируете записывать ещё — нажмите «Нет».",
+                'Очистка после загрузки',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            if ($delConfirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Step ('Удаляем папку OBS: ' + $InstallDir)
+                Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Step 'OBS оставлен на месте для повторной записи.'
+            }
+        }
+        Update-OverviewState
+    }
+})
+
+# ── Кнопка «Чистая установка» ──────────────────────────────────────────────
+$btnFresh.Add_Click({
+    if ($script:IsBusy) { return }
+    $confirm = [System.Windows.Forms.MessageBox]::Show('Удалить текущую установку OBS и установить заново?','Чистая установка',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $script:IsBusy = $true
+    Set-AuxControlsEnabled $false
+    Disable-Button $btnFresh
+    Set-Status 'Чистая установка...' 'Yellow'
+    try {
+        if (Test-Path $InstallDir) { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop }
+        Ensure-Tls12
+        New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
+        Install-ObsPortable -ForceDownload
+        Install-PortableSettings
+
+        Write-Step 'Проверяем доступ к Dropbox'
+        if (Test-DropboxAccess) {
+            Write-Step '✓ Доступ к Dropbox подтверждён'
+        } else {
+            Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
+        }
+
+        Set-Status 'OBS установлен чисто.' 'Green'
+        $script:ObsLaunchCompleted = $false
+        Enable-Button $btnLaunch
+        Update-OverviewState
+    } catch {
+        Write-ErrorDetails -Context 'Чистая установка OBS' -ErrorRecord $_
+        Set-Status ('Ошибка чистой установки: ' + $_.Exception.Message) 'Red'
+    } finally {
+        $script:IsBusy = $false
+        Set-AuxControlsEnabled $true
+        Enable-Button $btnFresh
+    }
+})
+
+# ── Кнопка «Очистить» ──────────────────────────────────────────────────────
+$btnClean.Add_Click({
+    if ($script:IsBusy) { return }
+    $confirm = [System.Windows.Forms.MessageBox]::Show('Удалить папку OBS и временные файлы?','Очистить',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    if (Test-Path $InstallDir) { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Step "Удалено $InstallDir" }
+    if (Test-Path $TempRoot)   { Remove-Item -LiteralPath $TempRoot   -Recurse -Force -ErrorAction SilentlyContinue }
+    Set-Status 'Очистка выполнена.' 'Green'
+    $script:ObsLaunchCompleted = $false
+    Disable-Button $btnLaunch
+    Update-OverviewState
+})
+
+# ── Кнопка «Открыть папку записей» ─────────────────────────────────────────
+$btnFolder.Add_Click({
+    if ($script:IsBusy) { return }
+    try {
+        if (Test-Path $script:RecordingRoot) {
+            Start-Process explorer.exe $script:RecordingRoot
+        } else {
+            Write-Step ('Папка записей не существует: ' + $script:RecordingRoot)
+            Set-Status ('Папка записей не существует: ' + $script:RecordingRoot) 'Red'
+        }
+    }
+    catch { Write-ErrorDetails -Context 'Открыть папку записей' -ErrorRecord $_ }
+})
+
+# ── Кнопка «Логи» ───────────────────────────────────────────────────────────
+$btnLogs.Add_Click({
+    try { Show-LogViewerDialog }
+    catch {
+        Write-ErrorDetails -Context 'Просмотр логов' -ErrorRecord $_
+        Set-Status ('Не удалось открыть логи: ' + $_.Exception.Message) 'Red'
+    }
+})
+
+# ── Закрытие окна (защита от закрытия во время загрузки) ──────────────────
+$form.Add_FormClosing({
+    param($sender, $e)
+    if ($script:IsUploading) {
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Идёт загрузка файлов в Dropbox!`n`nЕсли закрыть сейчас, загрузка прервётся.`nПри следующем запуске можно будет повторить загрузку.`n`nВы уверены?",
+            '⚠ Загрузка не завершена',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        if ($result -ne [System.Windows.Forms.DialogResult]::Yes) {
+            $e.Cancel = $true
+            return
+        }
+    }
+    elseif ($script:IsBusy) {
+        # Любая другая операция (установка/настройка) — тоже не закрываем молча,
+        # иначе получим полузаписанную папку OBS.
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Идёт операция (установка или настройка).`n`nЕсли закрыть сейчас, она прервётся и установка может остаться неполной.`n`nВсё равно закрыть?",
+            '⚠ Операция не завершена',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        if ($result -ne [System.Windows.Forms.DialogResult]::Yes) {
+            $e.Cancel = $true
+            return
+        }
+    }
+    # Гарантированно останавливаем предпросмотр камеры (освобождаем COM-граф/устройство).
+    try { [GoodwinCam.CameraPreview]::Stop() } catch {}
+    try { if ($script:StateTimer) { $script:StateTimer.Stop(); $script:StateTimer.Dispose() } } catch {}
+    if (Test-Path $TempRoot) {
+        Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+})
+
+# Привязываем иконку и предупреждение к окну PowerShell-консоли, после чего сворачиваем его
+try {
+    if ($script:AppIcon) { [ConsoleHelper]::SetConsoleIcon($script:AppIcon.Handle) }
+    try { $Host.UI.RawUI.WindowTitle = 'Goodwin OBS — процесс приложения' } catch {}
+    Write-Host ''
+    Write-Host '╔══════════════════════════════════════════════════════════╗' -ForegroundColor Yellow
+    Write-Host '║  НЕ ЗАКРЫВАЙТЕ ЭТО ОКНО!                                 ║' -ForegroundColor Yellow
+    Write-Host '║  Основные логи пишутся в файл и доступны кнопкой Логи.   ║' -ForegroundColor Yellow
+    Write-Host '║  Окно можно свернуть — но не закрывайте,                 ║' -ForegroundColor Yellow
+    Write-Host '║  иначе приложение завершится.                            ║' -ForegroundColor Yellow
+    Write-Host '╚══════════════════════════════════════════════════════════╝' -ForegroundColor Yellow
+    Write-Host ''
+    [ConsoleHelper]::MinimizeConsole()
+} catch {}
+
+Write-Log 'Goodwin OBS запущен'
+if ($script:SelectedNickname -and $script:SelectedNickname -ne 'untitled') {
+    Write-Step "Загружены настройки: никнейм = $script:SelectedNickname"
+}
+Write-Step 'Готов к работе. Нажмите «Установить» для начала.'
+[System.Windows.Forms.Application]::Run($form)
