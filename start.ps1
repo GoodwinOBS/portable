@@ -129,7 +129,7 @@ if ($needsSta -or $needsAdmin) {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Скрипт работает открыто: без скрытых окон, без зашифрованных или обфусцированных
-# блоков, без изменения настроек антивируса. Настройки OBS встроены в скрипт.
+# блоков, без изменения настроек антивируса. Настройки OBS скачиваются из GoodwinOBS/portable.
 # Dropbox access token получается через официальный OAuth API; для публичной
 # раздачи скрипта лучше вынести OAuth-секреты и refresh token на сервер.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,716 +154,10 @@ $script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
 $script:UploadProgressActive = $false
 $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
 $TempRoot = Join-Path $InstallDir '.tmp_install'
-$script:BundledObsSceneCollectionFile = 'goodwin_obs.json'
-$script:BundledObsSceneCollectionJson = @'
-СОДЕРЖИМОЕ КОНФИГА СНИЗУ
-{
-    "name": "goodwin_obs",
-    "DesktopAudioDevice1": {
-        "prev_ver": 536936450,
-        "name": "Desktop Audio",
-        "uuid": "14b84844-a41c-4a89-92e4-c5beaac9f405",
-        "id": "wasapi_output_capture",
-        "versioned_id": "wasapi_output_capture",
-        "settings": {
-            "device_id": "default"
-        },
-        "mixers": 192,
-        "sync": 0,
-        "flags": 0,
-        "volume": 1.0,
-        "balance": 0.5,
-        "enabled": true,
-        "muted": true,
-        "push-to-mute": false,
-        "push-to-mute-delay": 0,
-        "push-to-talk": false,
-        "push-to-talk-delay": 0,
-        "hotkeys": {
-            "libobs.mute": [],
-            "libobs.unmute": [],
-            "libobs.push-to-mute": [],
-            "libobs.push-to-talk": []
-        },
-        "deinterlace_mode": 0,
-        "deinterlace_field_order": 0,
-        "monitoring_type": 0,
-        "private_settings": {
-            "mixer_hidden": false
-        }
-    },
-    "AuxAudioDevice1": {
-        "prev_ver": 536936450,
-        "name": "Mic/Aux",
-        "uuid": "4c516bf1-0245-4a6f-bab5-87458c011cdc",
-        "id": "wasapi_input_capture",
-        "versioned_id": "wasapi_input_capture",
-        "settings": {
-            "device_id": "{0.0.1.00000000}.{6a796c73-49ac-480b-98fa-f1a6ba380cf3}"
-        },
-        "mixers": 195,
-        "sync": 0,
-        "flags": 2,
-        "volume": 0.7638749480247498,
-        "balance": 0.5,
-        "enabled": true,
-        "muted": false,
-        "push-to-mute": false,
-        "push-to-mute-delay": 0,
-        "push-to-talk": false,
-        "push-to-talk-delay": 0,
-        "hotkeys": {
-            "libobs.mute": [],
-            "libobs.unmute": [],
-            "libobs.push-to-mute": [],
-            "libobs.push-to-talk": []
-        },
-        "deinterlace_mode": 0,
-        "deinterlace_field_order": 0,
-        "monitoring_type": 0,
-        "private_settings": {}
-    },
-    "sources": [
-        {
-            "prev_ver": 536936450,
-            "name": "Webcam",
-            "uuid": "2891b909-0491-4305-93bf-ef9f39c8e2a0",
-            "id": "dshow_input",
-            "versioned_id": "dshow_input",
-            "settings": {
-                "video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-                "last_video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
-            },
-            "mixers": 0,
-            "sync": 0,
-            "flags": 0,
-            "volume": 1.0,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": true,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "libobs.mute": [],
-                "libobs.unmute": [],
-                "libobs.push-to-mute": [],
-                "libobs.push-to-talk": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536936450,
-            "name": "DISCORD",
-            "uuid": "58da036f-6a16-4e82-9074-9b1ecd1262db",
-            "id": "wasapi_process_output_capture",
-            "versioned_id": "wasapi_process_output_capture",
-            "settings": {
-                "window": "@goosyarajkee - Discord:Chrome_WidgetWin_1:Discord.exe",
-                "priority": 2
-            },
-            "mixers": 197,
-            "sync": 0,
-            "flags": 0,
-            "volume": 0.7988331913948059,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "libobs.mute": [],
-                "libobs.unmute": [],
-                "libobs.push-to-mute": [],
-                "libobs.push-to-talk": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536936450,
-            "name": "DOTA",
-            "uuid": "b1e7afaf-6c89-4bad-916c-e22d895fd4d5",
-            "id": "game_capture",
-            "versioned_id": "game_capture",
-            "settings": {
-                "capture_audio": true,
-                "window": "Dota 2:SDL_app:dota2.exe",
-                "capture_mode": "window"
-            },
-            "mixers": 201,
-            "sync": 0,
-            "flags": 0,
-            "volume": 1.0,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "libobs.mute": [],
-                "libobs.unmute": [],
-                "libobs.push-to-mute": [],
-                "libobs.push-to-talk": [],
-                "hotkey_start": [],
-                "hotkey_stop": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536936450,
-            "name": "Раскраски",
-            "uuid": "a26f1c9c-96cb-426a-b00b-7218ef1102f7",
-            "id": "game_capture",
-            "versioned_id": "game_capture",
-            "settings": {
-                "capture_mode": "window",
-                "window": "Chameleon  :UnrealWindow:PenguinHotel-Win64-Shipping.exe",
-                "capture_audio": true
-            },
-            "mixers": 201,
-            "sync": 0,
-            "flags": 0,
-            "volume": 0.7952919006347656,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "libobs.mute": [],
-                "libobs.unmute": [],
-                "libobs.push-to-mute": [],
-                "libobs.push-to-talk": [],
-                "hotkey_start": [],
-                "hotkey_stop": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536936450,
-            "name": "PUBG",
-            "uuid": "67ad3bc4-2552-4474-a3d3-dfe554778e0b",
-            "id": "game_capture",
-            "versioned_id": "game_capture",
-            "settings": {
-                "capture_mode": "window",
-                "window": "PUBG#3A BATTLEGROUNDS :UnrealWindow:TslGame.exe",
-                "capture_audio": true
-            },
-            "mixers": 201,
-            "sync": 0,
-            "flags": 0,
-            "volume": 0.7952919006347656,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "libobs.mute": [],
-                "libobs.unmute": [],
-                "libobs.push-to-mute": [],
-                "libobs.push-to-talk": [],
-                "hotkey_start": [],
-                "hotkey_stop": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536936450,
-            "name": "Minecraft",
-            "uuid": "b4c16491-51f3-4797-9aaf-4880cb76208c",
-            "id": "game_capture",
-            "versioned_id": "game_capture",
-            "settings": {
-                "capture_mode": "window",
-                "window": "Minecraft 26.2:GLFW30:javaw.exe",
-                "capture_audio": true
-            },
-            "mixers": 201,
-            "sync": 0,
-            "flags": 0,
-            "volume": 0.7952919006347656,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "libobs.mute": [],
-                "libobs.unmute": [],
-                "libobs.push-to-mute": [],
-                "libobs.push-to-talk": [],
-                "hotkey_start": [],
-                "hotkey_stop": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536936450,
-            "name": "goodwin",
-            "uuid": "a75f2deb-3eed-41ea-adaf-dc21aac37d90",
-            "id": "scene",
-            "versioned_id": "scene",
-            "settings": {
-                "custom_size": false,
-                "id_counter": 10,
-                "items": [
-                    {
-                        "name": "DISCORD",
-                        "source_uuid": "58da036f-6a16-4e82-9074-9b1ecd1262db",
-                        "visible": true,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 0,
-                        "bounds_align": 0,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 3,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": -1.0
-                        },
-                        "scale": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "scale_rel": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "duration": 0
-                        },
-                        "hide_transition": {
-                            "duration": 0
-                        },
-                        "private_settings": {}
-                    },
-                    {
-                        "name": "PUBG",
-                        "source_uuid": "67ad3bc4-2552-4474-a3d3-dfe554778e0b",
-                        "visible": true,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 0,
-                        "bounds_align": 0,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 9,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": -1.0
-                        },
-                        "scale": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "scale_rel": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "duration": 300
-                        },
-                        "hide_transition": {
-                            "duration": 300
-                        },
-                        "private_settings": {}
-                    },
-                    {
-                        "name": "Раскраски",
-                        "source_uuid": "a26f1c9c-96cb-426a-b00b-7218ef1102f7",
-                        "visible": true,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 0,
-                        "bounds_align": 0,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 8,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": -1.0
-                        },
-                        "scale": {
-                            "x": 0.75,
-                            "y": 0.75
-                        },
-                        "scale_rel": {
-                            "x": 0.75,
-                            "y": 0.75
-                        },
-                        "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "duration": 300
-                        },
-                        "hide_transition": {
-                            "duration": 300
-                        },
-                        "private_settings": {}
-                    },
-                    {
-                        "name": "DOTA",
-                        "source_uuid": "b1e7afaf-6c89-4bad-916c-e22d895fd4d5",
-                        "visible": true,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 1,
-                        "bounds_align": 5,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 2,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": -1.0
-                        },
-                        "scale": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "scale_rel": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "bounds": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "bounds_rel": {
-                            "x": 3.555555582046509,
-                            "y": 2.0
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "duration": 0
-                        },
-                        "hide_transition": {
-                            "duration": 0
-                        },
-                        "private_settings": {}
-                    },
-                    {
-                        "name": "Webcam",
-                        "source_uuid": "2891b909-0491-4305-93bf-ef9f39c8e2a0",
-                        "visible": true,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 2,
-                        "bounds_align": 5,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 7,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 800.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": 0.4814814329147339
-                        },
-                        "scale": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "scale_rel": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "bounds": {
-                            "x": 498.0,
-                            "y": 280.0
-                        },
-                        "bounds_rel": {
-                            "x": 0.9222221970558167,
-                            "y": 0.5185185074806213
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "duration": 0
-                        },
-                        "hide_transition": {
-                            "duration": 0
-                        },
-                        "private_settings": {}
-                    },
-                    {
-                        "name": "Minecraft",
-                        "source_uuid": "b4c16491-51f3-4797-9aaf-4880cb76208c",
-                        "visible": true,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 0,
-                        "bounds_align": 0,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 10,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": -1.0
-                        },
-                        "scale": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "scale_rel": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "duration": 300
-                        },
-                        "hide_transition": {
-                            "duration": 300
-                        },
-                        "private_settings": {}
-                    }
-                ]
-            },
-            "mixers": 0,
-            "sync": 0,
-            "flags": 0,
-            "volume": 1.0,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "OBSBasic.SelectScene": [],
-                "libobs.show_scene_item.3": [],
-                "libobs.hide_scene_item.3": [],
-                "libobs.show_scene_item.2": [],
-                "libobs.hide_scene_item.2": [],
-                "libobs.show_scene_item.7": [],
-                "libobs.hide_scene_item.7": [],
-                "libobs.show_scene_item.8": [],
-                "libobs.hide_scene_item.8": [],
-                "libobs.show_scene_item.9": [],
-                "libobs.hide_scene_item.9": [],
-                "libobs.show_scene_item.10": [],
-                "libobs.hide_scene_item.10": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "canvas_uuid": "6c69626f-6273-4c00-9d88-c5136d61696e",
-            "private_settings": {}
-        }
-    ],
-    "groups": [],
-    "scene_order": [
-        {
-            "name": "goodwin"
-        }
-    ],
-    "current_scene": "goodwin",
-    "current_program_scene": "goodwin",
-    "canvases": [],
-    "current_transition": "Затухание",
-    "transition_duration": 300,
-    "transitions": [],
-    "quick_transitions": [],
-    "saved_projectors": [],
-    "preview_locked": false,
-    "scaling_enabled": false,
-    "scaling_level": -6,
-    "scaling_off_x": 0.0,
-    "scaling_off_y": 0.0,
-    "virtual-camera": {
-        "type2": 3
-    },
-    "modules": {
-        "auto-scene-switcher": {
-            "interval": 300,
-            "non_matching_scene": "",
-            "switch_if_not_matching": false,
-            "active": false,
-            "switches": []
-        },
-        "captions": {
-            "source": "",
-            "enabled": false,
-            "lang_id": 1049,
-            "provider": "mssapi"
-        },
-        "output-timer": {
-            "streamTimerHours": 0,
-            "streamTimerMinutes": 0,
-            "streamTimerSeconds": 30,
-            "recordTimerHours": 0,
-            "recordTimerMinutes": 0,
-            "recordTimerSeconds": 30,
-            "autoStartStreamTimer": false,
-            "autoStartRecordTimer": false,
-            "pauseRecordTimer": true
-        },
-        "scripts-tool": []
-    },
-    "resolution": {
-        "x": 1920,
-        "y": 1080
-    },
-    "migration_resolution": {
-        "x": 1920,
-        "y": 1080
-    },
-    "version": 2
-}
-КОНЕЦ КОНФИГА OBS
-'@
+$script:PortableRepoOwner = 'GoodwinOBS'
+$script:PortableRepoName = 'portable'
+$script:PortableRepoBranch = 'main'
+$script:PortableAssetsDirName = 'assets'
 $script:BundledObsProfilesZipBase64 = @'
 UEsDBBQAAAAIAAqM3lzMgGjyagMAAGEHAAASAAAAYW1kX2hpZ2gvYmFzaWMuaW5pjVXfb+I4EH73X7EvPJ26CuFH25P8kIZmFwlolvS4qwAhNxnAIrEjx6Fw
 f/2N7UBhWen2AfB8Mx7PfPMZz7+BAMXyJZmwAigrstWWb7aEzF9qXdZ6ScYyAxpkeyZSyEjEcxAYGUlVMK252NBWGL693bXG47vWYPCltd3etYrirlVVZAA5
@@ -1527,37 +821,186 @@ function Write-LinesFileAtomic {
     Write-TextFileAtomic -Path $Path -Content (($Lines -join "`r`n") + "`r`n")
 }
 
-function Get-BundledObsSceneCollectionJson {
-    $raw = $script:BundledObsSceneCollectionJson.Trim()
-    $startMarker = 'СОДЕРЖИМОЕ КОНФИГА СНИЗУ'
-    $endMarker = 'КОНЕЦ КОНФИГА OBS'
+function Get-GitHubRawPath {
+    param([Parameter(Mandatory = $true)][string] $Path)
 
-    if ($raw.StartsWith($startMarker) -and $raw.EndsWith($endMarker)) {
-        $jsonStart = $startMarker.Length
-        $jsonLength = $raw.Length - $jsonStart - $endMarker.Length
-        return $raw.Substring($jsonStart, $jsonLength).Trim()
-    }
-
-    return $raw
+    return (($Path -split '/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
 }
 
-function Install-BundledObsSceneCollection {
-    param([Parameter(Mandatory = $true)][string] $ConfigDir)
-
-    $sceneCollectionJson = Get-BundledObsSceneCollectionJson
+function Get-PortableRepoFiles {
+    $headers = @{ 'User-Agent' = 'goodwin_obs-portable-installer' }
+    $treeUrl = "https://api.github.com/repos/$script:PortableRepoOwner/$script:PortableRepoName/git/trees/$script:PortableRepoBranch`?recursive=1"
 
     try {
-        $null = $sceneCollectionJson | ConvertFrom-Json
+        $tree = Invoke-RestMethod -Uri $treeUrl -Headers $headers
     }
     catch {
-        throw "Встроенный goodwin_obs.json повреждён: $($_.Exception.Message)"
+        throw "Не удалось получить список файлов GoodwinOBS/portable: $($_.Exception.Message)"
+    }
+
+    $files = @($tree.tree | Where-Object {
+        $_.type -eq 'blob' -and
+        -not [string]::IsNullOrWhiteSpace($_.path) -and
+        ([IO.Path]::GetFileName($_.path) -ne 'start.ps1')
+    })
+
+    if (-not $files) {
+        throw 'В GoodwinOBS/portable не найдено файлов для установки OBS-настроек'
+    }
+
+    return $files
+}
+
+function Get-PortableRepoFileBytes {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $rawPath = Get-GitHubRawPath -Path $Path
+    $uri = "https://raw.githubusercontent.com/$script:PortableRepoOwner/$script:PortableRepoName/$script:PortableRepoBranch/$rawPath"
+    $maxAttempts = 4
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $wc = $null
+        try {
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add('User-Agent', 'goodwin_obs-portable-installer')
+            $bytes = $wc.DownloadData($uri)
+            return ,$bytes
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) {
+                throw "Не удалось скачать $Path из GoodwinOBS/portable: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds ([math]::Min(12, [math]::Pow(2, $attempt)))
+        }
+        finally {
+            if ($wc) { $wc.Dispose() }
+        }
+    }
+}
+
+function Get-PortableAssetFileName {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    return [IO.Path]::GetFileName(($Path -replace '/', '\'))
+}
+
+function ConvertTo-ObsPath {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    return ([IO.Path]::GetFullPath($Path) -replace '\\', '/')
+}
+
+function Set-ObsSceneAssetPaths {
+    param(
+        [Parameter(Mandatory = $true)][object] $Object,
+        [Parameter(Mandatory = $true)][hashtable] $AssetMap
+    )
+
+    $changed = $false
+    if ($null -eq $Object) {
+        return $false
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        foreach ($item in $Object) {
+            if (Set-ObsSceneAssetPaths -Object $item -AssetMap $AssetMap) {
+                $changed = $true
+            }
+        }
+        return $changed
+    }
+
+    foreach ($property in @($Object.PSObject.Properties)) {
+        $value = $property.Value
+
+        if ($property.Name -eq 'file' -and $value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+            $fileName = Get-PortableAssetFileName -Path $value
+            if ($AssetMap.ContainsKey($fileName)) {
+                $newPath = ConvertTo-ObsPath -Path $AssetMap[$fileName]
+                if ($value -ne $newPath) {
+                    $property.Value = $newPath
+                    $changed = $true
+                }
+            }
+        }
+        elseif ($value -and $value -isnot [string]) {
+            if (Set-ObsSceneAssetPaths -Object $value -AssetMap $AssetMap) {
+                $changed = $true
+            }
+        }
+    }
+
+    return $changed
+}
+
+function Install-PortableRepoObsFiles {
+    param([Parameter(Mandatory = $true)][string] $ConfigDir)
+
+    Write-Step 'Скачиваем настройки OBS из GoodwinOBS/portable'
+
+    $repoFiles = Get-PortableRepoFiles
+    $sceneFiles = @($repoFiles | Where-Object { [IO.Path]::GetExtension($_.path) -ieq '.json' })
+    $assetFiles = @($repoFiles | Where-Object { [IO.Path]::GetExtension($_.path) -ine '.json' })
+
+    if (-not $sceneFiles) {
+        throw 'В GoodwinOBS/portable не найдено JSON-файлов сцен'
     }
 
     $sceneDir = Join-Path $ConfigDir 'basic\scenes'
-    $scenePath = Join-Path $sceneDir $script:BundledObsSceneCollectionFile
+    $assetsDir = Join-Path $InstallDir $script:PortableAssetsDirName
     New-Item -ItemType Directory -Force -Path $sceneDir | Out-Null
-    Write-TextFileAtomic -Path $scenePath -Content ($sceneCollectionJson + "`r`n")
-    Write-Log "Настройки OBS сцены записаны локально: $scenePath"
+    New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+
+    $assetMap = @{}
+    foreach ($assetFile in $assetFiles) {
+        $assetName = Get-PortableAssetFileName -Path $assetFile.path
+        if ([string]::IsNullOrWhiteSpace($assetName)) {
+            continue
+        }
+        if ($assetMap.ContainsKey($assetName)) {
+            throw "В GoodwinOBS/portable найдено несколько asset-файлов с именем $assetName"
+        }
+
+        $targetPath = Join-Path $assetsDir $assetName
+        $bytes = Get-PortableRepoFileBytes -Path $assetFile.path
+        Write-BytesFileAtomic -Path $targetPath -Bytes $bytes
+        $assetMap[$assetName] = $targetPath
+    }
+
+    $installedScenes = 0
+    foreach ($sceneFile in $sceneFiles) {
+        $sceneName = Get-PortableAssetFileName -Path $sceneFile.path
+        if ([string]::IsNullOrWhiteSpace($sceneName)) {
+            continue
+        }
+
+        $sceneBytes = Get-PortableRepoFileBytes -Path $sceneFile.path
+        $sceneJsonText = $script:Utf8NoBom.GetString($sceneBytes)
+        if ($sceneJsonText.Length -gt 0 -and $sceneJsonText[0] -eq [char]0xFEFF) {
+            $sceneJsonText = $sceneJsonText.Substring(1)
+        }
+        try {
+            $sceneJson = $sceneJsonText | ConvertFrom-Json
+        }
+        catch {
+            throw "Файл сцены $($sceneFile.path) повреждён: $($_.Exception.Message)"
+        }
+
+        if ($assetMap.Count -gt 0) {
+            $null = Set-ObsSceneAssetPaths -Object $sceneJson -AssetMap $assetMap
+            $sceneJsonText = $sceneJson | ConvertTo-Json -Depth 100
+        }
+
+        $scenePath = Join-Path $sceneDir $sceneName
+        Write-TextFileAtomic -Path $scenePath -Content ($sceneJsonText.Trim() + "`r`n")
+        $installedScenes++
+    }
+
+    if ($installedScenes -le 0) {
+        throw 'Не удалось установить ни одного JSON-файла сцены'
+    }
+
+    Write-Log "Настройки OBS скачаны из GoodwinOBS/portable: сцен=$installedScenes, assets=$($assetMap.Count), assetsDir=$assetsDir"
 }
 
 function Install-BundledObsProfiles {
@@ -1995,7 +1438,7 @@ function Set-ObsSceneLayout {
         }
     }
 
-    Write-Log 'Размещение сцены берётся из встроенного goodwin_obs.json; автоматически фиксируется только resolution=1920x1080'
+    Write-Log 'Размещение сцены берётся из JSON-файлов GoodwinOBS/portable; автоматически фиксируется только resolution=1920x1080'
 }
 
 function Show-LowDiskSpaceWarning {
@@ -2155,7 +1598,7 @@ function Set-ActiveObsProfile {
         $profileName = 'cpu_medium'
     }
 
-    $preferredScenePath = Join-Path $sceneRoot $script:BundledObsSceneCollectionFile
+    $preferredScenePath = Join-Path $sceneRoot 'goodwin_obs.json'
     $sceneFile = if (Test-Path -LiteralPath $preferredScenePath) {
         Get-Item -LiteralPath $preferredScenePath
     } else {
@@ -2265,8 +1708,8 @@ function Install-PortableSettings {
     New-Item -ItemType File -Force -Path $portableFlag | Out-Null
     New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
-    Write-Log 'Применяем встроенные настройки OBS'
-    Install-BundledObsSceneCollection -ConfigDir $configDir
+    Write-Log 'Скачиваем и применяем настройки OBS из GoodwinOBS/portable'
+    Install-PortableRepoObsFiles -ConfigDir $configDir
     Install-BundledObsProfiles -ConfigDir $configDir
 
     Set-PortableObsConfig
