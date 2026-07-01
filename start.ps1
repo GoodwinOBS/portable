@@ -64,22 +64,65 @@ $script:IsBusy = $false
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 
-# Проверка STA-режима для WinForms
-if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+# Проверка STA-режима для WinForms и прав администратора.
+function Test-GoodwinAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([AllowNull()][string] $Value)
+    if ($null -eq $Value) { return "''" }
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Start-GoodwinRestart {
+    param(
+        [Parameter(Mandatory = $true)][string] $ScriptPath,
+        [bool] $Elevated
+    )
+
+    $scriptLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ScriptPath
+    $goodwinKey = [Environment]::GetEnvironmentVariable('GOODWIN_OBS_KEY', 'Process')
+    if ([string]::IsNullOrEmpty($goodwinKey)) {
+        $command = "& $scriptLiteral"
+    } else {
+        $keyLiteral = ConvertTo-PowerShellSingleQuotedLiteral $goodwinKey
+        $command = "`$env:GOODWIN_OBS_KEY = $keyLiteral; & $scriptLiteral"
+    }
+
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $arguments = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand)
+    if ($Elevated) {
+        Start-Process powershell.exe -Verb RunAs -WindowStyle Minimized -ArgumentList $arguments
+    } else {
+        Start-Process powershell.exe -WindowStyle Minimized -ArgumentList $arguments
+    }
+}
+
+$needsSta = ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA')
+$needsAdmin = -not (Test-GoodwinAdministrator)
+if ($needsSta -or $needsAdmin) {
     $scriptPath = $MyInvocation.MyCommand.Path
     if (-not $scriptPath) {
-        # Запуск через irm | iex — сохраняем скрипт в штатную директорию
-        $InstallDir = Join-Path $env:USERPROFILE 'Downloads\GoodwinOBS'
-        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-        $scriptPath = Join-Path $InstallDir 'goodwin_obs.ps1'
+        # Запуск через irm | iex — сохраняем скрипт в штатную директорию.
+        $restartDir = Join-Path $env:USERPROFILE 'Downloads\GoodwinOBS'
+        New-Item -ItemType Directory -Force -Path $restartDir | Out-Null
+        $scriptPath = Join-Path $restartDir 'goodwin_obs.ps1'
         $scriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
         [IO.File]::WriteAllText($scriptPath, $scriptContent, (New-Object System.Text.UTF8Encoding($true)))
     }
-    if (Test-Path $scriptPath) {
-        Start-Process powershell.exe -WindowStyle Minimized -ArgumentList '-STA','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`""
+    if (Test-Path -LiteralPath $scriptPath) {
+        Start-GoodwinRestart -ScriptPath $scriptPath -Elevated $needsAdmin
         exit
     } else {
-        Write-Host 'Запустите скрипт в STA-режиме: powershell -STA -File goodwin_obs.ps1'
+        Write-Host 'Запустите скрипт от имени администратора в STA-режиме: powershell -STA -ExecutionPolicy Bypass -File goodwin_obs.ps1'
         exit
     }
 }
