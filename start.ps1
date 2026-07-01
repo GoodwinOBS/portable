@@ -5534,7 +5534,12 @@ function Paint-GoodwinButton {
     $parentColor = if ($Button.Parent) { $Button.Parent.BackColor } else { $colorBg }
     $g.Clear($parentColor)
 
-    $rect = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, ([int]($Button.Width - 1)), ([int]($Button.Height - 1))
+    $outerGlowPadding = if ($style.PSObject.Properties['OuterGlowPadding']) {
+        [int]$style.OuterGlowPadding
+    } else {
+        0
+    }
+    $rect = New-Object System.Drawing.Rectangle -ArgumentList $outerGlowPadding, $outerGlowPadding, ([int]($Button.Width - (2 * $outerGlowPadding) - 1)), ([int]($Button.Height - (2 * $outerGlowPadding) - 1))
     $bg = $style.BaseColor
     if (-not $Button.Enabled) {
         $bg = $style.DisabledColor
@@ -5573,16 +5578,31 @@ function Paint-GoodwinButton {
     $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $topColor, $bottomColor, [System.Drawing.Drawing2D.LinearGradientMode]::Vertical)
     $borderPen = New-Object System.Drawing.Pen($border, 1)
     try {
+        if ($Button.Enabled -and $style.BlinkActive) {
+            $pulse = if ($null -ne $script:BlinkPulse) { [double]$script:BlinkPulse } else { 0.0 }
+            $blinkBase = $style.BlinkBorderColor
+            $glowAlpha = [int](70 + (115 * $pulse))
+            $glowColor = [System.Drawing.Color]::FromArgb($glowAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
+            $glowPen = New-Object System.Drawing.Pen($glowColor, ([single](6.0 + (4.0 * $pulse))))
+            try {
+                $glowPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+                $g.DrawPath($glowPen, $path)
+            }
+            finally {
+                $glowPen.Dispose()
+            }
+        }
+
         $g.FillPath($brush, $path)
 
         if ($style.HighlightAlpha -gt 0 -and $Button.Enabled) {
-            $innerRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
+            $innerRect = New-Object System.Drawing.Rectangle -ArgumentList ([int]($rect.X + 2)), ([int]($rect.Y + 2)), ([int]($rect.Width - 4)), ([int]($rect.Height - 4))
             $innerPath = New-RoundedRectPath $innerRect ([math]::Max(2, $style.Radius - 2))
             $topPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(([math]::Min(95, $style.HighlightAlpha + 18)), 255, 255, 255), 1)
             $bottomPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(34, 0, 0, 0), 1)
             try {
                 $g.DrawPath($topPen, $innerPath)
-                $g.DrawLine($bottomPen, 8, ($Button.Height - 2), ($Button.Width - 9), ($Button.Height - 2))
+                $g.DrawLine($bottomPen, ($rect.X + 8), ($rect.Bottom - 1), ($rect.Right - 8), ($rect.Bottom - 1))
             }
             finally {
                 $bottomPen.Dispose()
@@ -5596,26 +5616,12 @@ function Paint-GoodwinButton {
         if ($Button.Enabled -and $style.BlinkActive) {
             $pulse = if ($null -ne $script:BlinkPulse) { [double]$script:BlinkPulse } else { 0.0 }
             $blinkBase = $style.BlinkBorderColor
-            $glowAlpha = [int](55 + (120 * $pulse))
-            $lineAlpha = [int](150 + (105 * $pulse))
-            $glowColor = [System.Drawing.Color]::FromArgb($glowAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
+            $lineAlpha = [int](145 + (110 * $pulse))
             $blinkColor = [System.Drawing.Color]::FromArgb($lineAlpha, $blinkBase.R, $blinkBase.G, $blinkBase.B)
-            $glowRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
-            $glowPath = New-RoundedRectPath $glowRect ([math]::Max(2, $style.Radius - 1))
-            $glowPen = New-Object System.Drawing.Pen($glowColor, ([single](5.0 + (2.0 * $pulse))))
-            try { $g.DrawPath($glowPen, $glowPath) }
-            finally {
-                $glowPen.Dispose()
-                $glowPath.Dispose()
-            }
-
-            $blinkRect = New-Object System.Drawing.Rectangle -ArgumentList 2, 2, ([int]($Button.Width - 5)), ([int]($Button.Height - 5))
-            $blinkPath = New-RoundedRectPath $blinkRect ([math]::Max(2, $style.Radius - 1))
-            $blinkPen = New-Object System.Drawing.Pen($blinkColor, ([single](2.8 + (1.4 * $pulse))))
-            try { $g.DrawPath($blinkPen, $blinkPath) }
+            $blinkPen = New-Object System.Drawing.Pen($blinkColor, ([single](1.4 + (0.8 * $pulse))))
+            try { $g.DrawPath($blinkPen, $path) }
             finally {
                 $blinkPen.Dispose()
-                $blinkPath.Dispose()
             }
         }
 
@@ -5630,20 +5636,20 @@ function Paint-GoodwinButton {
         $iconW = if ($Button.Image) { $Button.Image.Width } else { 0 }
         $totalW = $iconW + $gap + $textSize.Width
         $startX = if ($hasText) {
-            [math]::Max(12, [int](($Button.Width - $totalW) / 2))
+            $rect.X + [math]::Max(12, [int](($rect.Width - $totalW) / 2))
         } else {
-            [int](($Button.Width - $totalW) / 2)
+            $rect.X + [int](($rect.Width - $totalW) / 2)
         }
 
         if ($Button.Image) {
-            $iconY = [int](($Button.Height - $Button.Image.Height) / 2)
+            $iconY = [int]($rect.Y + (($rect.Height - $Button.Image.Height) / 2))
             $iconRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, $iconY, $Button.Image.Width, $Button.Image.Height
             $g.DrawImage($Button.Image, $iconRect)
             $startX += $Button.Image.Width + $gap
         }
 
         if ($hasText) {
-            $textRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, 0, ([int]([math]::Max(20, $Button.Width - $startX - 12))), $Button.Height
+            $textRect = New-Object System.Drawing.Rectangle -ArgumentList $startX, $rect.Y, ([int]([math]::Max(20, $rect.Right - $startX - 12))), $rect.Height
             $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
                      [System.Windows.Forms.TextFormatFlags]::Left -bor
                      [System.Windows.Forms.TextFormatFlags]::SingleLine -bor
@@ -5667,7 +5673,8 @@ function Set-UiButtonStyle {
         [bool] $Bold = $false,
         [int] $Radius = 9,
         [System.Drawing.Color] $BorderColor = ([System.Drawing.Color]::FromArgb(78, 91, 112)),
-        [int] $HighlightAlpha = 18
+        [int] $HighlightAlpha = 18,
+        [int] $OuterGlowPadding = 0
     )
     $Button.FlatStyle = 'Flat'
     $Button.FlatAppearance.BorderSize = 0
@@ -5692,6 +5699,7 @@ function Set-UiButtonStyle {
         DisabledBorderColor = [System.Drawing.Color]::FromArgb(46, 54, 68)
         Radius              = $Radius
         HighlightAlpha      = $HighlightAlpha
+        OuterGlowPadding    = [math]::Max(0, $OuterGlowPadding)
         State               = 'Normal'
         BlinkActive         = $false
         BlinkBorderColor    = (Get-ShiftedColor $HoverColor 74)
@@ -5886,18 +5894,20 @@ $script:ToolTip.SetToolTip($txtCamSel.Parent, 'Выбрать камеру')
 
 # === Статус ===
 $statusPanel = New-InnerPanel $headerPanel 24 78 852 28 ([System.Drawing.Color]::FromArgb(18, 23, 31))
+$initialObsReady = Test-Path -LiteralPath (Join-Path $InstallDir 'bin\64bit\obs64.exe')
+$initialStatusColor = if ($initialObsReady) { $colorGreen } else { $colorMuted }
 $statusAccent = New-Object System.Windows.Forms.Panel
 $statusAccent.Location = New-Object System.Drawing.Point(0, 0)
 $statusAccent.Size = New-Object System.Drawing.Size(4, 28)
-$statusAccent.BackColor = $colorAccent
+$statusAccent.BackColor = $initialStatusColor
 $statusPanel.Controls.Add($statusAccent)
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Location = New-Object System.Drawing.Point(16, 5)
 $lblStatus.Size     = New-Object System.Drawing.Size(816, 18)
-$lblStatus.ForeColor = $colorMuted
+$lblStatus.ForeColor = $initialStatusColor
 $lblStatus.Font = New-Object System.Drawing.Font('Segoe UI', 8.8)
-$lblStatus.Text = 'Готов к установке'
+$lblStatus.Text = if ($initialObsReady) { 'OBS готов к запуску' } else { 'Готов к установке' }
 $statusPanel.Controls.Add($lblStatus)
 $script:StatusLabel_ref = $lblStatus
 
@@ -5912,10 +5922,11 @@ function New-MainButton {
         [bool] $Enabled = $true
     )
     $btn = New-Object System.Windows.Forms.Button
-    $btn.Location = New-Object System.Drawing.Point($X, $Y)
-    $btn.Size     = New-Object System.Drawing.Size(270, 50)
+    $glowPadding = 6
+    $btn.Location = New-Object System.Drawing.Point(($X - $glowPadding), ($Y - $glowPadding))
+    $btn.Size     = New-Object System.Drawing.Size((270 + (2 * $glowPadding)), (50 + (2 * $glowPadding)))
     $btn.Text = $Text
-    Set-UiButtonStyle -Button $btn -Color $Color -HoverColor $HoverColor -ForeColor ([System.Drawing.Color]::White) -Bold $true -Radius 11 -BorderColor (Get-ShiftedColor $HoverColor 18) -HighlightAlpha 24
+    Set-UiButtonStyle -Button $btn -Color $Color -HoverColor $HoverColor -ForeColor ([System.Drawing.Color]::White) -Bold $true -Radius 11 -BorderColor (Get-ShiftedColor $HoverColor 18) -HighlightAlpha 24 -OuterGlowPadding $glowPadding
     $btn.Enabled = $Enabled
     if (-not $Enabled) { $btn.Invalidate() }
     $form.Controls.Add($btn)
@@ -5941,13 +5952,12 @@ Set-ButtonIcon -Button $btnLaunch -Kind 'play'
 Set-ButtonIcon -Button $btnUpload -Kind 'upload'
 
 # === Вспомогательные кнопки ===
-$btnFolder = New-SecondaryButton 'Папка записей'    24  284 198
-$btnFresh  = New-SecondaryButton 'Чистая установка' 242 284 198
-$btnClean  = New-SecondaryButton 'Очистить'         460 284 198
-$btnLogs   = New-SecondaryButton 'Логи'             678 284 198
+$btnFolder = New-SecondaryButton 'Папка записей'    133 284 198
+$btnFresh  = New-SecondaryButton 'Чистая установка' 351 284 198
+$btnClean  = $null
+$btnLogs   = New-SecondaryButton 'Логи'             569 284 198
 Set-ButtonIcon -Button $btnFolder -Kind 'folder' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 Set-ButtonIcon -Button $btnFresh -Kind 'refresh' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
-Set-ButtonIcon -Button $btnClean -Kind 'trash' -Color ([System.Drawing.Color]::FromArgb(248, 113, 113))
 Set-ButtonIcon -Button $btnLogs -Kind 'logs' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 
 function Set-Status {
@@ -6006,6 +6016,7 @@ function Update-OverviewState {
 
 function Enable-Button  {
     param($b)
+    if (-not $b) { return }
     $b.Enabled = $true
     if ($b.Tag -and $b.Tag.ButtonStyle -eq 'Goodwin') {
         $b.BackColor = $b.Tag.BaseColor
@@ -6021,6 +6032,7 @@ function Enable-Button  {
 }
 function Disable-Button {
     param($b)
+    if (-not $b) { return }
     $b.Enabled = $false
     if ($b.Tag -and $b.Tag.ButtonStyle -eq 'Goodwin') {
         $b.BackColor = $b.Tag.DisabledColor
@@ -6139,34 +6151,6 @@ $script:StateTimer.Add_Tick({
     }
 })
 $script:StateTimer.Start()
-
-$script:StartupDropboxCheckStarted = $false
-$form.Add_Shown({
-    if ($script:StartupDropboxCheckStarted) { return }
-    $script:StartupDropboxCheckStarted = $true
-
-    $script:StartupDropboxCheckTimer = New-Object System.Windows.Forms.Timer
-    $script:StartupDropboxCheckTimer.Interval = 250
-    $script:StartupDropboxCheckTimer.Add_Tick({
-        param($sender, $eventArgs)
-        try {
-            $sender.Stop()
-            $sender.Dispose()
-            Write-Step 'Проверяем доступ к Dropbox'
-            if (Test-DropboxAccess) {
-                Write-Step 'Доступ к Dropbox подтверждён'
-            } else {
-                Write-Step 'Не удалось подтвердить доступ к Dropbox. Подробности доступны через «Логи».'
-            }
-            Update-OverviewState
-        }
-        catch {
-            Set-DropboxAccessState 'Ошибка'
-            Write-ErrorDetails -Context 'Стартовая проверка Dropbox' -ErrorRecord $_
-        }
-    })
-    $script:StartupDropboxCheckTimer.Start()
-})
 
 # ── Диалог выбора камеры (отдельное окно с кнопкой предпросмотра) ──────────
 function Show-CameraSelectionDialog {
@@ -7063,8 +7047,7 @@ $btnFresh.Add_Click({
     }
 })
 
-# ── Кнопка «Очистить» ──────────────────────────────────────────────────────
-$btnClean.Add_Click({
+function Invoke-CleanObs {
     if ($script:IsBusy) { return }
     $confirm = [System.Windows.Forms.MessageBox]::Show('Удалить папку OBS и временные файлы?','Очистить',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
@@ -7074,7 +7057,7 @@ $btnClean.Add_Click({
     $script:ObsLaunchCompleted = $false
     Disable-Button $btnLaunch
     Update-OverviewState
-})
+}
 
 # ── Кнопка «Открыть папку записей» ─────────────────────────────────────────
 $btnFolder.Add_Click({
