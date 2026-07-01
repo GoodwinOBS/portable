@@ -7032,20 +7032,6 @@ $btnUpload.Add_Click({
         if (Test-Path $TempRoot) {
             Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
-        if (Test-Path $InstallDir) {
-            $delConfirm = [System.Windows.Forms.MessageBox]::Show(
-                "Удалить портативную копию OBS?`n($InstallDir)`n`nЕсли планируете записывать ещё — нажмите «Нет».",
-                'Очистка после загрузки',
-                [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                [System.Windows.Forms.MessageBoxIcon]::Question
-            )
-            if ($delConfirm -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Write-Step ('Удаляем папку OBS: ' + $InstallDir)
-                Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-            } else {
-                Write-Step 'OBS оставлен на месте для повторной записи.'
-            }
-        }
         Update-OverviewState
     }
 })
