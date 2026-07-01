@@ -156,6 +156,7 @@ $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest
 $TempRoot = Join-Path $InstallDir '.tmp_install'
 $script:BundledObsSceneCollectionFile = 'goodwin_obs.json'
 $script:BundledObsSceneCollectionJson = @'
+СОДЕРЖИМОЕ КОНФИГА СНИЗУ
 {
     "name": "goodwin_obs",
     "DesktopAudioDevice1": {
@@ -861,6 +862,7 @@ $script:BundledObsSceneCollectionJson = @'
     },
     "version": 2
 }
+КОНЕЦ КОНФИГА OBS
 '@
 $script:BundledObsProfilesZipBase64 = @'
 UEsDBBQAAAAIAAqM3lzMgGjyagMAAGEHAAASAAAAYW1kX2hpZ2gvYmFzaWMuaW5pjVXfb+I4EH73X7EvPJ26CuFH25P8kIZmFwlolvS4qwAhNxnAIrEjx6Fw
@@ -1525,11 +1527,27 @@ function Write-LinesFileAtomic {
     Write-TextFileAtomic -Path $Path -Content (($Lines -join "`r`n") + "`r`n")
 }
 
+function Get-BundledObsSceneCollectionJson {
+    $raw = $script:BundledObsSceneCollectionJson.Trim()
+    $startMarker = 'СОДЕРЖИМОЕ КОНФИГА СНИЗУ'
+    $endMarker = 'КОНЕЦ КОНФИГА OBS'
+
+    if ($raw.StartsWith($startMarker) -and $raw.EndsWith($endMarker)) {
+        $jsonStart = $startMarker.Length
+        $jsonLength = $raw.Length - $jsonStart - $endMarker.Length
+        return $raw.Substring($jsonStart, $jsonLength).Trim()
+    }
+
+    return $raw
+}
+
 function Install-BundledObsSceneCollection {
     param([Parameter(Mandatory = $true)][string] $ConfigDir)
 
+    $sceneCollectionJson = Get-BundledObsSceneCollectionJson
+
     try {
-        $null = $script:BundledObsSceneCollectionJson | ConvertFrom-Json
+        $null = $sceneCollectionJson | ConvertFrom-Json
     }
     catch {
         throw "Встроенный goodwin_obs.json повреждён: $($_.Exception.Message)"
@@ -1538,7 +1556,7 @@ function Install-BundledObsSceneCollection {
     $sceneDir = Join-Path $ConfigDir 'basic\scenes'
     $scenePath = Join-Path $sceneDir $script:BundledObsSceneCollectionFile
     New-Item -ItemType Directory -Force -Path $sceneDir | Out-Null
-    Write-TextFileAtomic -Path $scenePath -Content ($script:BundledObsSceneCollectionJson.Trim() + "`r`n")
+    Write-TextFileAtomic -Path $scenePath -Content ($sceneCollectionJson + "`r`n")
     Write-Log "Настройки OBS сцены записаны локально: $scenePath"
 }
 
