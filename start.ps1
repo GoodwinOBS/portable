@@ -62,7 +62,6 @@ $script:IsBusy = $false
 
 # Загружаем System.Net.Http один раз (для chunked upload)
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
-Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 
 # Проверка STA-режима для WinForms и прав администратора.
 function Test-GoodwinAdministrator {
@@ -152,154 +151,14 @@ $script:SettingsFile      = Join-Path $env:APPDATA 'goodwin_obs\settings.json'
 $script:UploadHistoryFile = Join-Path $env:APPDATA 'goodwin_obs\uploaded.json'
 $script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
 $script:UploadProgressActive = $false
-$script:DebugVersion = 'debug-2026-07-01.2'
+$script:DebugVersion = 'debug-2026-07-01.3'
 $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
 $TempRoot = Join-Path $InstallDir '.tmp_install'
 $script:PortableRepoOwner = 'GoodwinOBS'
 $script:PortableRepoName = 'portable'
 $script:PortableRepoBranch = 'main'
 $script:PortableAssetsDirName = 'assets'
-$script:BundledObsProfilesZipBase64 = @'
-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
-X21lZGl1bS9zdHJlYW1FbmNvZGVyLmpzb24uYmFrUEsBAhQAFAAAAAgACozeXDkzSBJ/AwAAjQcAABUAAAAAAAAAAAAAAAAAwBoAAG52aWRpYV9oaWdoL2Jh
-c2ljLmluaVBLAQIUABQAAAAIAAqM3lwM9X+KPwAAAEIAAAAeAAAAAAAAAAAAAAAAAHIeAABudmlkaWFfaGlnaC9yZWNvcmRFbmNvZGVyLmpzb25QSwECFAAU
-AAAACAAKjN5caFv/WjwAAAA/AAAAIgAAAAAAAAAAAAAAAADtHgAAbnZpZGlhX2hpZ2gvcmVjb3JkRW5jb2Rlci5qc29uLmJha1BLAQIUABQAAAAIAAqM3lyL
-v+tIfQMAAIwHAAAUAAAAAAAAAAAAAAAAAGkfAABudmlkaWFfbG93L2Jhc2ljLmluaVBLAQIUABQAAAAIAAqM3lzfz2kPQAAAAEIAAAAdAAAAAAAAAAAAAAAA
-ABgjAABudmlkaWFfbG93L3JlY29yZEVuY29kZXIuanNvblBLAQIUABQAAAAIAAqM3lzrsvqGdQMAAH8HAAAXAAAAAAAAAAAAAAAAAJMjAABudmlkaWFfbWVk
-aXVtL2Jhc2ljLmluaVBLAQIUABQAAAAIAAqM3lzq7HClPAAAAD8AAAAgAAAAAAAAAAAAAAAAAD0nAABudmlkaWFfbWVkaXVtL3JlY29yZEVuY29kZXIuanNv
-blBLAQIUABQAAAAIAAqM3lwM9X+KPwAAAEIAAAAkAAAAAAAAAAAAAAAAALcnAABudmlkaWFfbWVkaXVtL3JlY29yZEVuY29kZXIuanNvbi5iYWtQSwUGAAAA
-ABwAHADrBwAAOCgAAAAA
-'@
-
+$script:PortableProfilesFile = 'profiles.txt'
 # Прогресс загрузки: одна строка состояния на каждый параллельно загружаемый
 # файл в памяти; агрегированный прогресс выводится в нижнюю строку состояния.
 # $script:MultiProgressState: [ordered]@{ FileName -> @{ Uploaded; Total; Status } }
@@ -941,7 +800,10 @@ function Install-PortableRepoObsFiles {
 
     $repoFiles = Get-PortableRepoFiles
     $sceneFiles = @($repoFiles | Where-Object { [IO.Path]::GetExtension($_.path) -ieq '.json' })
-    $assetFiles = @($repoFiles | Where-Object { [IO.Path]::GetExtension($_.path) -ine '.json' })
+    $assetFiles = @($repoFiles | Where-Object {
+        [IO.Path]::GetExtension($_.path) -ine '.json' -and
+        ([IO.Path]::GetFileName($_.path) -ne $script:PortableProfilesFile)
+    })
 
     if (-not $sceneFiles) {
         throw 'В GoodwinOBS/portable не найдено JSON-файлов сцен'
@@ -1004,61 +866,102 @@ function Install-PortableRepoObsFiles {
     Write-Log "Настройки OBS скачаны из GoodwinOBS/portable: сцен=$installedScenes, assets=$($assetMap.Count), assetsDir=$assetsDir"
 }
 
-function Install-BundledObsProfiles {
+function ConvertFrom-PortableProfilesText {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Content)
+
+    if ($Content.Length -gt 0 -and $Content[0] -eq [char]0xFEFF) {
+        $Content = $Content.Substring(1)
+    }
+
+    $lines = $Content -split '\r?\n', -1
+    $entries = New-Object System.Collections.Generic.List[object]
+    $i = 0
+
+    while ($i -lt $lines.Count) {
+        $line = $lines[$i]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) {
+            $i++
+            continue
+        }
+
+        if ($line -notmatch '^===== FILE (?<path>.+) =====$') {
+            throw "Недопустимая строка в $($script:PortableProfilesFile): $line"
+        }
+
+        $relativePath = $Matches['path'].Trim()
+        if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            throw "Пустой путь файла в $script:PortableProfilesFile"
+        }
+
+        $i++
+        $contentLines = New-Object System.Collections.Generic.List[string]
+        while ($i -lt $lines.Count -and $lines[$i] -ne '===== END FILE =====') {
+            $contentLines.Add($lines[$i])
+            $i++
+        }
+
+        if ($i -ge $lines.Count) {
+            throw "Не найден конец блока для профиля $relativePath"
+        }
+
+        $entries.Add([pscustomobject]@{
+            Path = $relativePath
+            Content = ($contentLines -join "`r`n")
+        })
+        $i++
+    }
+
+    if ($entries.Count -le 0) {
+        throw "$script:PortableProfilesFile не содержит файлов профилей"
+    }
+
+    return $entries.ToArray()
+}
+
+function Install-PortableRepoObsProfiles {
     param([Parameter(Mandatory = $true)][string] $ConfigDir)
 
     $profileRoot = Join-Path $ConfigDir 'basic\profiles'
     New-Item -ItemType Directory -Force -Path $profileRoot | Out-Null
 
-    $zipBytes = [Convert]::FromBase64String(($script:BundledObsProfilesZipBase64 -replace '\s', ''))
-    $stream = New-Object IO.MemoryStream -ArgumentList (,$zipBytes)
-    $archive = $null
-    $count = 0
-    try {
-        $archive = New-Object IO.Compression.ZipArchive -ArgumentList $stream, ([IO.Compression.ZipArchiveMode]::Read)
-        $profileRootFull = [IO.Path]::GetFullPath($profileRoot).TrimEnd('\') + '\'
+    Write-Step "Скачиваем профили OBS из $script:PortableProfilesFile"
 
-        foreach ($entry in $archive.Entries) {
-            if ([string]::IsNullOrWhiteSpace($entry.FullName) -or $entry.FullName.EndsWith('/')) {
+    try {
+        $profilesBytes = Get-PortableRepoFileBytes -Path $script:PortableProfilesFile
+        $profilesText = $script:Utf8NoBom.GetString($profilesBytes)
+        $profileEntries = ConvertFrom-PortableProfilesText -Content $profilesText
+        $profileRootFull = [IO.Path]::GetFullPath($profileRoot).TrimEnd('\') + '\'
+        $count = 0
+
+        foreach ($entry in $profileEntries) {
+            if ([string]::IsNullOrWhiteSpace($entry.Path)) {
                 continue
             }
 
-            $relativePath = $entry.FullName.Replace('/', '\')
+            $relativePath = $entry.Path.Replace('/', '\')
             if ([IO.Path]::IsPathRooted($relativePath) -or $relativePath -match '(^|\\)\.\.(\\|$)') {
-                throw "Недопустимый путь во встроенных профилях OBS: $($entry.FullName)"
+                throw "Недопустимый путь в $($script:PortableProfilesFile): $($entry.Path)"
             }
 
             $targetPath = Join-Path $profileRoot $relativePath
             $targetFull = [IO.Path]::GetFullPath($targetPath)
             if (-not $targetFull.StartsWith($profileRootFull, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Недопустимый путь во встроенных профилях OBS: $($entry.FullName)"
+                throw "Недопустимый путь в $($script:PortableProfilesFile): $($entry.Path)"
             }
 
-            $entryStream = $entry.Open()
-            $entryBytes = New-Object IO.MemoryStream
-            try {
-                $entryStream.CopyTo($entryBytes)
-                Write-BytesFileAtomic -Path $targetFull -Bytes $entryBytes.ToArray()
-                $count++
-            }
-            finally {
-                $entryStream.Dispose()
-                $entryBytes.Dispose()
-            }
+            Write-TextFileAtomic -Path $targetFull -Content ($entry.Content.TrimEnd([char[]]@("`r", "`n")) + "`r`n")
+            $count++
         }
+
+        if ($count -le 0) {
+            throw "$script:PortableProfilesFile не содержит файлов профилей"
+        }
+
+        Write-Log "Профили OBS скачаны из GoodwinOBS/portable/$($script:PortableProfilesFile): $profileRoot ($count файлов)"
     }
     catch {
-        throw "Не удалось применить встроенные профили OBS: $($_.Exception.Message)"
+        throw "Не удалось применить профили OBS из $($script:PortableProfilesFile): $($_.Exception.Message)"
     }
-    finally {
-        if ($archive) { $archive.Dispose() }
-        $stream.Dispose()
-    }
-
-    if ($count -le 0) {
-        throw 'Встроенные профили OBS пустые'
-    }
-    Write-Log "Профили OBS записаны локально: $profileRoot ($count файлов)"
 }
 
 function Set-IniValue {
@@ -1711,7 +1614,7 @@ function Install-PortableSettings {
 
     Write-Log 'Скачиваем и применяем настройки OBS из GoodwinOBS/portable'
     Install-PortableRepoObsFiles -ConfigDir $configDir
-    Install-BundledObsProfiles -ConfigDir $configDir
+    Install-PortableRepoObsProfiles -ConfigDir $configDir
 
     Set-PortableObsConfig
 }
@@ -5154,6 +5057,7 @@ $btnLaunch.Add_Click({
         }
         $configDir = Join-Path $InstallDir 'config\obs-studio'
         Install-PortableRepoObsFiles -ConfigDir $configDir
+        Install-PortableRepoObsProfiles -ConfigDir $configDir
         Set-PortableObsConfig
         Set-Status 'Запускаем OBS...' 'Yellow'
         Start-PortableObs
