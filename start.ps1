@@ -5096,8 +5096,8 @@ $script:AppIcon = Get-AppIcon
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Goodwin OBS'
 if ($script:AppIcon) { $form.Icon = $script:AppIcon }
-$form.ClientSize = New-Object System.Drawing.Size(900, 336)
-$form.MinimumSize = New-Object System.Drawing.Size(920, 376)
+$form.ClientSize = New-Object System.Drawing.Size(860, 324)
+$form.MinimumSize = New-Object System.Drawing.Size(880, 364)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -5849,7 +5849,7 @@ function New-CompactInfoCard {
 }
 
 # === Шапка ===
-$headerPanel = New-PanelBlock 0 0 900 118 ([System.Drawing.Color]::FromArgb(17, 22, 31))
+$headerPanel = New-PanelBlock 0 0 860 106 ([System.Drawing.Color]::FromArgb(17, 22, 31))
 $brandBadge = New-IconBadge $headerPanel 'brand' 24 12 ([System.Drawing.Color]::FromArgb(12, 74, 110)) ([System.Drawing.Color]::FromArgb(186, 230, 253)) 54 30
 
 $lblTitle = New-UiLabel $headerPanel 'Goodwin OBS' 92 11 205 34 $true $colorText
@@ -5858,21 +5858,21 @@ $lblSubtitle = New-UiLabel $headerPanel 'OBS SETUP' 94 48 180 18 $false $colorMu
 $lblSubtitle.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
 
 # === Краткое состояние ===
-$quickStatusPanel = New-InnerPanel $headerPanel 318 11 558 54 $colorPanel2
-$nickMini = New-CompactInfoCard $quickStatusPanel 'НИК' 10 5 150 $colorAccent
+$quickStatusPanel = New-InnerPanel $headerPanel 298 11 538 54 $colorPanel2
+$nickMini = New-CompactInfoCard $quickStatusPanel 'НИК' 10 5 140 $colorAccent
 $script:NickStateLabel_ref = $nickMini.StateLabel
 
-$dropboxMini = New-CompactInfoCard $quickStatusPanel 'DROPBOX' 170 5 116 $colorBlue
+$dropboxMini = New-CompactInfoCard $quickStatusPanel 'DROPBOX' 160 5 108 $colorBlue
 $script:DropboxStateLabel_ref = $dropboxMini.StateLabel
 
-$obsMini = New-CompactInfoCard $quickStatusPanel 'OBS' 296 5 130 $colorGreen
+$obsMini = New-CompactInfoCard $quickStatusPanel 'OBS' 278 5 112 $colorGreen
 $script:ObsStateLabel_ref = $obsMini.StateLabel
 
-$uploadMini = New-CompactInfoCard $quickStatusPanel 'ЗАГРУЗКА' 446 5 102 $colorAmber
+$uploadMini = New-CompactInfoCard $quickStatusPanel 'ЗАГРУЗКА' 400 5 128 $colorAmber
 $script:UploadStateLabel_ref = $uploadMini.StateLabel
 
 # === Параметры ===
-$settingsPanel = New-PanelBlock 24 130 852 74 $colorPanel
+$settingsPanel = New-PanelBlock 24 118 812 74 $colorPanel
 
 $lblPath = New-UiLabel $settingsPanel 'Путь записи' 18 10 150
 $txtPath = New-UiTextBox $settingsPanel 18 32 392 $script:RecordingRoot $true
@@ -5881,32 +5881,29 @@ $script:ToolTip.SetToolTip($txtPath, 'Изменить папку записи')
 $script:ToolTip.SetToolTip($txtPath.Parent, 'Изменить папку записи')
 
 $lblMic = New-UiLabel $settingsPanel 'Микрофон' 432 10 150
-$txtMicSel = New-UiTextBox $settingsPanel 432 32 190 $(if ($script:SelectedMic) { $script:SelectedMic } else { 'Авто' }) $true
+$txtMicSel = New-UiTextBox $settingsPanel 432 32 170 $(if ($script:SelectedMic) { $script:SelectedMic } else { 'Авто' }) $true
 Set-ClickableTextFieldStyle $txtMicSel
 $script:ToolTip.SetToolTip($txtMicSel, 'Выбрать микрофон')
 $script:ToolTip.SetToolTip($txtMicSel.Parent, 'Выбрать микрофон')
 
-$lblCam = New-UiLabel $settingsPanel 'Камера' 644 10 150
-$txtCamSel = New-UiTextBox $settingsPanel 644 32 190 $(if ($script:SelectedCamera) { $script:SelectedCamera } else { 'Авто' }) $true
+$lblCam = New-UiLabel $settingsPanel 'Камера' 624 10 150
+$txtCamSel = New-UiTextBox $settingsPanel 624 32 170 $(if ($script:SelectedCamera) { $script:SelectedCamera } else { 'Авто' }) $true
 Set-ClickableTextFieldStyle $txtCamSel
 $script:ToolTip.SetToolTip($txtCamSel, 'Выбрать камеру')
 $script:ToolTip.SetToolTip($txtCamSel.Parent, 'Выбрать камеру')
 
 # === Статус ===
-$statusPanel = New-InnerPanel $headerPanel 24 78 852 28 ([System.Drawing.Color]::FromArgb(18, 23, 31))
+$statusPanel = New-InnerPanel $headerPanel 24 72 812 22 ([System.Drawing.Color]::FromArgb(18, 23, 31))
 $initialObsReady = Test-Path -LiteralPath (Join-Path $InstallDir 'bin\64bit\obs64.exe')
 $initialStatusColor = if ($initialObsReady) { $colorGreen } else { $colorMuted }
-$statusAccent = New-Object System.Windows.Forms.Panel
-$statusAccent.Location = New-Object System.Drawing.Point(0, 0)
-$statusAccent.Size = New-Object System.Drawing.Size(4, 28)
-$statusAccent.BackColor = $initialStatusColor
-$statusPanel.Controls.Add($statusAccent)
+$statusAccent = $null
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(16, 5)
-$lblStatus.Size     = New-Object System.Drawing.Size(816, 18)
+$lblStatus.Location = New-Object System.Drawing.Point(0, 2)
+$lblStatus.Size     = New-Object System.Drawing.Size(812, 18)
 $lblStatus.ForeColor = $initialStatusColor
 $lblStatus.Font = New-Object System.Drawing.Font('Segoe UI', 8.8)
+$lblStatus.TextAlign = 'MiddleCenter'
 $lblStatus.Text = if ($initialObsReady) { 'OBS готов к запуску' } else { 'Готов к установке' }
 $statusPanel.Controls.Add($lblStatus)
 $script:StatusLabel_ref = $lblStatus
@@ -5924,7 +5921,7 @@ function New-MainButton {
     $btn = New-Object System.Windows.Forms.Button
     $glowPadding = 6
     $btn.Location = New-Object System.Drawing.Point(($X - $glowPadding), ($Y - $glowPadding))
-    $btn.Size     = New-Object System.Drawing.Size((270 + (2 * $glowPadding)), (50 + (2 * $glowPadding)))
+    $btn.Size     = New-Object System.Drawing.Size((256 + (2 * $glowPadding)), (50 + (2 * $glowPadding)))
     $btn.Text = $Text
     Set-UiButtonStyle -Button $btn -Color $Color -HoverColor $HoverColor -ForeColor ([System.Drawing.Color]::White) -Bold $true -Radius 11 -BorderColor (Get-ShiftedColor $HoverColor 18) -HighlightAlpha 24 -OuterGlowPadding $glowPadding
     $btn.Enabled = $Enabled
@@ -5944,18 +5941,18 @@ function New-SecondaryButton {
     return $btn
 }
 
-$btnInstall = New-MainButton 'Установить OBS' 24  216  ([System.Drawing.Color]::FromArgb(20, 111, 60))  ([System.Drawing.Color]::FromArgb(27, 143, 76))
-$btnLaunch  = New-MainButton 'Запустить OBS'  315 216  ([System.Drawing.Color]::FromArgb(31, 82, 154))  ([System.Drawing.Color]::FromArgb(43, 105, 196)) $false
-$btnUpload  = New-MainButton 'Загрузить запись' 606 216 ([System.Drawing.Color]::FromArgb(145, 88, 22)) ([System.Drawing.Color]::FromArgb(181, 110, 25))
+$btnInstall = New-MainButton 'Установить OBS' 24  204  ([System.Drawing.Color]::FromArgb(20, 111, 60))  ([System.Drawing.Color]::FromArgb(27, 143, 76))
+$btnLaunch  = New-MainButton 'Запустить OBS'  302 204  ([System.Drawing.Color]::FromArgb(31, 82, 154))  ([System.Drawing.Color]::FromArgb(43, 105, 196)) $false
+$btnUpload  = New-MainButton 'Загрузить запись' 580 204 ([System.Drawing.Color]::FromArgb(145, 88, 22)) ([System.Drawing.Color]::FromArgb(181, 110, 25))
 Set-ButtonIcon -Button $btnInstall -Kind 'install'
 Set-ButtonIcon -Button $btnLaunch -Kind 'play'
 Set-ButtonIcon -Button $btnUpload -Kind 'upload'
 
 # === Вспомогательные кнопки ===
-$btnFolder = New-SecondaryButton 'Папка записей'    133 284 198
-$btnFresh  = New-SecondaryButton 'Чистая установка' 351 284 198
+$btnFolder = New-SecondaryButton 'Папка записей'    113 272 198
+$btnFresh  = New-SecondaryButton 'Чистая установка' 331 272 198
 $btnClean  = $null
-$btnLogs   = New-SecondaryButton 'Логи'             569 284 198
+$btnLogs   = New-SecondaryButton 'Логи'             549 272 198
 Set-ButtonIcon -Button $btnFolder -Kind 'folder' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 Set-ButtonIcon -Button $btnFresh -Kind 'refresh' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
 Set-ButtonIcon -Button $btnLogs -Kind 'logs' -Color ([System.Drawing.Color]::FromArgb(226, 232, 240))
@@ -5970,7 +5967,7 @@ function Set-Status {
     }
     $c = $map[$Color]
     $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb($c[0], $c[1], $c[2])
-    $statusAccent.BackColor = $lblStatus.ForeColor
+    if ($statusAccent) { $statusAccent.BackColor = $lblStatus.ForeColor }
     $lblStatus.Text = $Text
     [System.Windows.Forms.Application]::DoEvents()
 }
