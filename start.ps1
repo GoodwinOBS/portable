@@ -152,6 +152,7 @@ $script:SettingsFile      = Join-Path $env:APPDATA 'goodwin_obs\settings.json'
 $script:UploadHistoryFile = Join-Path $env:APPDATA 'goodwin_obs\uploaded.json'
 $script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
 $script:UploadProgressActive = $false
+$script:DebugVersion = 'debug-2026-07-01.2'
 $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
 $TempRoot = Join-Path $InstallDir '.tmp_install'
 $script:PortableRepoOwner = 'GoodwinOBS'
@@ -5151,6 +5152,8 @@ $btnLaunch.Add_Click({
             $obsRunning | Stop-Process -Force
             Start-Sleep -Seconds 2
         }
+        $configDir = Join-Path $InstallDir 'config\obs-studio'
+        Install-PortableRepoObsFiles -ConfigDir $configDir
         Set-PortableObsConfig
         Set-Status 'Запускаем OBS...' 'Yellow'
         Start-PortableObs
@@ -5443,6 +5446,7 @@ try {
 } catch {}
 
 Write-Log 'Goodwin OBS запущен'
+Write-Step "Debug версия программы: $script:DebugVersion"
 if ($script:SelectedNickname -and $script:SelectedNickname -ne 'untitled') {
     Write-Step "Загружены настройки: никнейм = $script:SelectedNickname"
 }
