@@ -2857,11 +2857,308 @@ function Get-MciError {
     return $b.ToString()
 }
 
+Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace GoodwinAudioTest {
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    public class MMDeviceEnumeratorComObject { }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDeviceEnumerator {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int dwStateMask, IntPtr ppDevices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+        [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string pwstrId, out IMMDevice ppDevice);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDevice {
+        [PreserveSig] int Activate([MarshalAs(UnmanagedType.LPStruct)] Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+        [PreserveSig] int OpenPropertyStore(int stgmAccess, IntPtr ppProperties);
+        [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string ppstrId);
+        [PreserveSig] int GetState(out int pdwState);
+    }
+
+    [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IAudioClient {
+        [PreserveSig] int Initialize(int shareMode, int streamFlags, long hnsBufferDuration, long hnsPeriodicity, IntPtr pFormat, ref Guid audioSessionGuid);
+        [PreserveSig] int GetBufferSize(out uint pNumBufferFrames);
+        [PreserveSig] int GetStreamLatency(out long phnsLatency);
+        [PreserveSig] int GetCurrentPadding(out uint pNumPaddingFrames);
+        [PreserveSig] int IsFormatSupported(int shareMode, IntPtr pFormat, out IntPtr ppClosestMatch);
+        [PreserveSig] int GetMixFormat(out IntPtr ppDeviceFormat);
+        [PreserveSig] int GetDevicePeriod(out long phnsDefaultDevicePeriod, out long phnsMinimumDevicePeriod);
+        [PreserveSig] int Start();
+        [PreserveSig] int Stop();
+        [PreserveSig] int Reset();
+        [PreserveSig] int SetEventHandle(IntPtr eventHandle);
+        [PreserveSig] int GetService(ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+    }
+
+    [ComImport, Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IAudioCaptureClient {
+        [PreserveSig] int GetBuffer(out IntPtr ppData, out uint pNumFramesToRead, out uint pdwFlags, out ulong pu64DevicePosition, out ulong pu64QPCPosition);
+        [PreserveSig] int ReleaseBuffer(uint NumFramesRead);
+        [PreserveSig] int GetNextPacketSize(out uint pNumFramesInNextPacket);
+    }
+
+    public static class WasapiRecorder {
+        const int eCapture = 1;
+        const int eConsole = 0;
+        const int CLSCTX_ALL = 23;
+        const int AUDCLNT_SHAREMODE_SHARED = 0;
+        const int AUDCLNT_BUFFERFLAGS_SILENT = 0x2;
+        const ushort WAVE_FORMAT_PCM = 1;
+        const ushort WAVE_FORMAT_IEEE_FLOAT = 3;
+        const ushort WAVE_FORMAT_EXTENSIBLE = 0xFFFE;
+
+        static readonly Guid IID_IAudioClient = new Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2");
+        static readonly Guid IID_IAudioCaptureClient = new Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317");
+        static readonly Guid SubtypePcm = new Guid("00000001-0000-0010-8000-00aa00389b71");
+        static readonly Guid SubtypeFloat = new Guid("00000003-0000-0010-8000-00aa00389b71");
+
+        class MixFormat {
+            public ushort Tag;
+            public ushort Channels;
+            public int SampleRate;
+            public ushort BlockAlign;
+            public ushort BitsPerSample;
+            public bool IsPcm;
+            public bool IsFloat;
+        }
+
+        public static void CaptureToWav(string deviceId, string path, int milliseconds) {
+            if (milliseconds < 1) milliseconds = 3000;
+            object enumObj = null;
+            IMMDevice dev = null;
+            object clientObj = null;
+            object captureObj = null;
+            IntPtr formatPtr = IntPtr.Zero;
+
+            try {
+                enumObj = new MMDeviceEnumeratorComObject();
+                var en = (IMMDeviceEnumerator)enumObj;
+                int hr;
+                if (string.IsNullOrEmpty(deviceId) || string.Equals(deviceId, "default", StringComparison.OrdinalIgnoreCase)) {
+                    hr = en.GetDefaultAudioEndpoint(eCapture, eConsole, out dev);
+                } else {
+                    hr = en.GetDevice(deviceId, out dev);
+                }
+                CheckHr(hr, "Get audio capture device");
+                if (dev == null) throw new InvalidOperationException("Audio capture device is not available.");
+
+                hr = dev.Activate(IID_IAudioClient, CLSCTX_ALL, IntPtr.Zero, out clientObj);
+                CheckHr(hr, "Activate IAudioClient");
+                var client = (IAudioClient)clientObj;
+
+                hr = client.GetMixFormat(out formatPtr);
+                CheckHr(hr, "GetMixFormat");
+                MixFormat fmt = ReadMixFormat(formatPtr);
+                if (fmt.Channels == 0 || fmt.BlockAlign == 0 || fmt.SampleRate == 0) {
+                    throw new InvalidOperationException("Unsupported audio capture format.");
+                }
+
+                Guid session = Guid.Empty;
+                hr = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0, formatPtr, ref session);
+                CheckHr(hr, "Initialize audio capture");
+
+                Guid captureId = IID_IAudioCaptureClient;
+                hr = client.GetService(ref captureId, out captureObj);
+                CheckHr(hr, "Get IAudioCaptureClient");
+                var capture = (IAudioCaptureClient)captureObj;
+
+                using (var pcm = new MemoryStream()) {
+                    CheckHr(client.Start(), "Start audio capture");
+                    var sw = Stopwatch.StartNew();
+                    try {
+                        while (sw.ElapsedMilliseconds < milliseconds) {
+                            uint packetFrames;
+                            CheckHr(capture.GetNextPacketSize(out packetFrames), "GetNextPacketSize");
+                            if (packetFrames == 0) {
+                                Thread.Sleep(10);
+                                continue;
+                            }
+
+                            while (packetFrames > 0) {
+                                IntPtr data;
+                                uint frames;
+                                uint flags;
+                                ulong devPos;
+                                ulong qpcPos;
+                                CheckHr(capture.GetBuffer(out data, out frames, out flags, out devPos, out qpcPos), "GetBuffer");
+                                try {
+                                    if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == IntPtr.Zero) {
+                                        WriteSilence(pcm, frames, fmt.Channels);
+                                    } else {
+                                        int byteCount = checked((int)(frames * fmt.BlockAlign));
+                                        byte[] raw = new byte[byteCount];
+                                        Marshal.Copy(data, raw, 0, raw.Length);
+                                        ConvertToPcm16(raw, frames, fmt, pcm);
+                                    }
+                                } finally {
+                                    CheckHr(capture.ReleaseBuffer(frames), "ReleaseBuffer");
+                                }
+                                CheckHr(capture.GetNextPacketSize(out packetFrames), "GetNextPacketSize");
+                            }
+                        }
+                    } finally {
+                        try { client.Stop(); } catch { }
+                    }
+
+                    WritePcm16Wave(path, fmt.SampleRate, fmt.Channels, pcm.ToArray());
+                }
+            } finally {
+                if (formatPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(formatPtr);
+                if (captureObj != null) { try { Marshal.ReleaseComObject(captureObj); } catch { } }
+                if (clientObj != null) { try { Marshal.ReleaseComObject(clientObj); } catch { } }
+                if (dev != null) { try { Marshal.ReleaseComObject(dev); } catch { } }
+                if (enumObj != null) { try { Marshal.ReleaseComObject(enumObj); } catch { } }
+            }
+        }
+
+        static MixFormat ReadMixFormat(IntPtr ptr) {
+            var fmt = new MixFormat();
+            fmt.Tag = unchecked((ushort)Marshal.ReadInt16(ptr, 0));
+            fmt.Channels = unchecked((ushort)Marshal.ReadInt16(ptr, 2));
+            fmt.SampleRate = Marshal.ReadInt32(ptr, 4);
+            fmt.BlockAlign = unchecked((ushort)Marshal.ReadInt16(ptr, 12));
+            fmt.BitsPerSample = unchecked((ushort)Marshal.ReadInt16(ptr, 14));
+            fmt.IsPcm = fmt.Tag == WAVE_FORMAT_PCM;
+            fmt.IsFloat = fmt.Tag == WAVE_FORMAT_IEEE_FLOAT;
+            if (fmt.Tag == WAVE_FORMAT_EXTENSIBLE) {
+                byte[] guidBytes = new byte[16];
+                Marshal.Copy(IntPtr.Add(ptr, 24), guidBytes, 0, guidBytes.Length);
+                Guid sub = new Guid(guidBytes);
+                fmt.IsPcm = sub == SubtypePcm;
+                fmt.IsFloat = sub == SubtypeFloat;
+            }
+            return fmt;
+        }
+
+        static void ConvertToPcm16(byte[] raw, uint frames, MixFormat fmt, Stream output) {
+            int channels = Math.Max(1, (int)fmt.Channels);
+            int bytesPerSample = Math.Max(1, (int)fmt.BitsPerSample / 8);
+            int blockAlign = fmt.BlockAlign;
+            for (uint frame = 0; frame < frames; frame++) {
+                int frameOffset = checked((int)frame * blockAlign);
+                for (int ch = 0; ch < channels; ch++) {
+                    int offset = frameOffset + (ch * bytesPerSample);
+                    short sample = 0;
+                    if (offset + bytesPerSample <= raw.Length) {
+                        sample = ConvertSample(raw, offset, fmt);
+                    }
+                    output.WriteByte((byte)(sample & 0xFF));
+                    output.WriteByte((byte)((sample >> 8) & 0xFF));
+                }
+            }
+        }
+
+        static short ConvertSample(byte[] raw, int offset, MixFormat fmt) {
+            if (fmt.IsFloat && fmt.BitsPerSample == 32) {
+                float f = BitConverter.ToSingle(raw, offset);
+                if (f > 1f) f = 1f;
+                if (f < -1f) f = -1f;
+                return (short)(f * 32767f);
+            }
+            if (fmt.IsFloat && fmt.BitsPerSample == 64) {
+                double d = BitConverter.ToDouble(raw, offset);
+                if (d > 1.0) d = 1.0;
+                if (d < -1.0) d = -1.0;
+                return (short)(d * 32767.0);
+            }
+            if (!fmt.IsPcm) return 0;
+            switch (fmt.BitsPerSample) {
+                case 8:
+                    return (short)((raw[offset] - 128) << 8);
+                case 16:
+                    return BitConverter.ToInt16(raw, offset);
+                case 24:
+                    int v24 = raw[offset] | (raw[offset + 1] << 8) | (raw[offset + 2] << 16);
+                    if ((v24 & 0x800000) != 0) v24 |= unchecked((int)0xFF000000);
+                    return (short)(v24 >> 8);
+                case 32:
+                    int v32 = BitConverter.ToInt32(raw, offset);
+                    return (short)(v32 >> 16);
+                default:
+                    return 0;
+            }
+        }
+
+        static void WriteSilence(Stream output, uint frames, ushort channels) {
+            int count = checked((int)(frames * Math.Max(1, (int)channels) * 2));
+            for (int i = 0; i < count; i++) output.WriteByte(0);
+        }
+
+        static void WritePcm16Wave(string path, int sampleRate, ushort channels, byte[] data) {
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+            using (var bw = new BinaryWriter(fs)) {
+                ushort blockAlign = (ushort)(channels * 2);
+                int byteRate = sampleRate * blockAlign;
+                bw.Write(new char[] { 'R', 'I', 'F', 'F' });
+                bw.Write(36 + data.Length);
+                bw.Write(new char[] { 'W', 'A', 'V', 'E' });
+                bw.Write(new char[] { 'f', 'm', 't', ' ' });
+                bw.Write(16);
+                bw.Write((ushort)1);
+                bw.Write(channels);
+                bw.Write(sampleRate);
+                bw.Write(byteRate);
+                bw.Write(blockAlign);
+                bw.Write((ushort)16);
+                bw.Write(new char[] { 'd', 'a', 't', 'a' });
+                bw.Write(data.Length);
+                bw.Write(data);
+            }
+        }
+
+        static void CheckHr(int hr, string operation) {
+            if (hr < 0) {
+                throw new InvalidOperationException(operation + " failed: HRESULT 0x" + hr.ToString("X8"), Marshal.GetExceptionForHR(hr));
+            }
+        }
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
 function Start-MicrophoneTest {
-    param([int] $DurationSec = 3)
+    param(
+        [int] $DurationSec = 3,
+        [string] $DeviceId = 'default'
+    )
     $tempWav = Join-Path $env:TEMP 'goodwin_mic_test.wav'
     $sb = New-Object System.Text.StringBuilder 256
     if (Test-Path $tempWav) { Remove-Item -LiteralPath $tempWav -Force -ErrorAction SilentlyContinue }
+
+    $playTestFile = {
+        param([string] $Path)
+        if (Test-Path $Path) {
+            $player = New-Object System.Media.SoundPlayer
+            try {
+                $player.SoundLocation = $Path
+                $player.PlaySync()
+            }
+            finally {
+                $player.Dispose()
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    $normalizedDeviceId = if ([string]::IsNullOrWhiteSpace($DeviceId)) { 'default' } else { $DeviceId }
+    try {
+        [GoodwinAudioTest.WasapiRecorder]::CaptureToWav($normalizedDeviceId, $tempWav, [math]::Max(1, $DurationSec) * 1000)
+        & $playTestFile $tempWav
+        return
+    } catch {
+        if ($normalizedDeviceId -ne 'default') {
+            throw
+        }
+        Write-Log "WASAPI-тест микрофона не удался, пробуем MCI: $($_.Exception.Message)"
+    }
 
     # Гарантируем, что alias 'mic_test' будет закрыт даже если record/save выкинут исключение —
     # иначе MCI-устройство остаётся открытым и следующий тест валится.
@@ -2883,17 +3180,7 @@ function Start-MicrophoneTest {
     finally {
         [MciWrapper]::mciSendString('close mic_test', $sb, 256, [IntPtr]::Zero) | Out-Null
     }
-    if (Test-Path $tempWav) {
-        $player = New-Object System.Media.SoundPlayer
-        try {
-            $player.SoundLocation = $tempWav
-            $player.PlaySync()
-        }
-        finally {
-            $player.Dispose()
-            Remove-Item -LiteralPath $tempWav -Force -ErrorAction SilentlyContinue
-        }
-    }
+    & $playTestFile $tempWav
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4607,7 +4894,7 @@ function Show-MicrophoneSelectionDialog {
     $dlg.Controls.Add($btnListen)
 
     $lblHint = New-Object System.Windows.Forms.Label
-    $lblHint.Text = "Запись использует микрофон, выбранный в Windows по умолчанию.`nЧтобы протестировать другой — задайте его «По умолчанию» в настройках звука."
+    $lblHint.Text = "Полоска и тест звука используют выбранный микрофон.`nЕсли устройство не слышно, выберите другое в списке."
     $lblHint.Location = New-Object System.Drawing.Point(220, 122)
     $lblHint.Size     = New-Object System.Drawing.Size(315, 36)
     $lblHint.ForeColor = $colorMuted
@@ -4669,7 +4956,11 @@ function Show-MicrophoneSelectionDialog {
         $btnListen.Text = 'Запись… 3 сек'
         [System.Windows.Forms.Application]::DoEvents()
         try {
-            Start-MicrophoneTest -DurationSec 3
+            $deviceId = 'default'
+            if ($cmb.SelectedIndex -gt 0) {
+                $deviceId = Get-MicrophoneDeviceIdByName -FriendlyName ([string]$cmb.SelectedItem)
+            }
+            Start-MicrophoneTest -DurationSec 3 -DeviceId $deviceId
         } catch {
             [System.Windows.Forms.MessageBox]::Show("Не удалось записать/воспроизвести: $($_.Exception.Message)", 'Ошибка', 'OK', 'Error') | Out-Null
         }
@@ -4692,6 +4983,338 @@ function Show-MicrophoneSelectionDialog {
         Write-Step "Выбран микрофон: $(if($script:SelectedMic){$script:SelectedMic}else{'Авто'})"
     }
     $dlg.Dispose()
+}
+
+function Show-PreLaunchDeviceCheckDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Проверка камеры и микрофона'
+    $dlg.Size = New-Object System.Drawing.Size(760, 680)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $colorBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    if ($script:AppIcon) { $dlg.Icon = $script:AppIcon }
+
+    $lblCam = New-Object System.Windows.Forms.Label
+    $lblCam.Text = 'Камера:'
+    $lblCam.Location = New-Object System.Drawing.Point(16, 18)
+    $lblCam.Size = New-Object System.Drawing.Size(70, 20)
+    $lblCam.ForeColor = $colorText
+    $dlg.Controls.Add($lblCam)
+
+    $cmbCam = New-Object System.Windows.Forms.ComboBox
+    $cmbCam.Location = New-Object System.Drawing.Point(92, 14)
+    $cmbCam.Size = New-Object System.Drawing.Size(520, 25)
+    $cmbCam.DropDownStyle = 'DropDownList'
+    $cmbCam.BackColor = $colorInput
+    $cmbCam.ForeColor = $colorText
+    $dlg.Controls.Add($cmbCam)
+
+    $btnRefreshCam = New-Object System.Windows.Forms.Button
+    $btnRefreshCam.Text = 'Обновить'
+    $btnRefreshCam.Location = New-Object System.Drawing.Point(624, 13)
+    $btnRefreshCam.Size = New-Object System.Drawing.Size(100, 27)
+    Set-UiButtonStyle -Button $btnRefreshCam -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnRefreshCam)
+
+    $pnlPreview = New-Object System.Windows.Forms.Panel
+    $pnlPreview.Location = New-Object System.Drawing.Point(16, 52)
+    $pnlPreview.Size = New-Object System.Drawing.Size(708, 398)
+    $pnlPreview.BackColor = [System.Drawing.Color]::FromArgb(9, 12, 18)
+    $pnlPreview.BorderStyle = 'FixedSingle'
+    $dlg.Controls.Add($pnlPreview)
+
+    $lblPreview = New-Object System.Windows.Forms.Label
+    $lblPreview.Text = 'Запуск предпросмотра камеры...'
+    $lblPreview.Location = New-Object System.Drawing.Point(0, 178)
+    $lblPreview.Size = New-Object System.Drawing.Size(708, 42)
+    $lblPreview.TextAlign = 'MiddleCenter'
+    $lblPreview.ForeColor = $colorMuted
+    $lblPreview.BackColor = [System.Drawing.Color]::Transparent
+    $pnlPreview.Controls.Add($lblPreview)
+
+    $lblMic = New-Object System.Windows.Forms.Label
+    $lblMic.Text = 'Микрофон:'
+    $lblMic.Location = New-Object System.Drawing.Point(16, 470)
+    $lblMic.Size = New-Object System.Drawing.Size(70, 20)
+    $lblMic.ForeColor = $colorText
+    $dlg.Controls.Add($lblMic)
+
+    $cmbMic = New-Object System.Windows.Forms.ComboBox
+    $cmbMic.Location = New-Object System.Drawing.Point(92, 466)
+    $cmbMic.Size = New-Object System.Drawing.Size(520, 25)
+    $cmbMic.DropDownStyle = 'DropDownList'
+    $cmbMic.BackColor = $colorInput
+    $cmbMic.ForeColor = $colorText
+    $dlg.Controls.Add($cmbMic)
+
+    $btnRefreshMic = New-Object System.Windows.Forms.Button
+    $btnRefreshMic.Text = 'Обновить'
+    $btnRefreshMic.Location = New-Object System.Drawing.Point(624, 465)
+    $btnRefreshMic.Size = New-Object System.Drawing.Size(100, 27)
+    Set-UiButtonStyle -Button $btnRefreshMic -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnRefreshMic)
+
+    $lblLevel = New-Object System.Windows.Forms.Label
+    $lblLevel.Text = 'Уровень:'
+    $lblLevel.Location = New-Object System.Drawing.Point(16, 507)
+    $lblLevel.Size = New-Object System.Drawing.Size(70, 20)
+    $lblLevel.ForeColor = $colorText
+    $dlg.Controls.Add($lblLevel)
+
+    $pnlLevel = New-Object System.Windows.Forms.Panel
+    $pnlLevel.Location = New-Object System.Drawing.Point(92, 503)
+    $pnlLevel.Size = New-Object System.Drawing.Size(330, 24)
+    $pnlLevel.BackColor = $colorInput
+    $pnlLevel.BorderStyle = 'FixedSingle'
+    $dlg.Controls.Add($pnlLevel)
+
+    $btnSoundTest = New-Object System.Windows.Forms.Button
+    $btnSoundTest.Text = 'Тест звука (3 сек)'
+    $btnSoundTest.Location = New-Object System.Drawing.Point(444, 498)
+    $btnSoundTest.Size = New-Object System.Drawing.Size(168, 34)
+    Set-UiButtonStyle -Button $btnSoundTest -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
+    $dlg.Controls.Add($btnSoundTest)
+
+    $lblHint = New-Object System.Windows.Forms.Label
+    $lblHint.Text = 'Проверьте картинку и звук. Если устройство выбрано неверно, смените его в списке перед запуском OBS.'
+    $lblHint.Location = New-Object System.Drawing.Point(16, 542)
+    $lblHint.Size = New-Object System.Drawing.Size(708, 34)
+    $lblHint.ForeColor = $colorMuted
+    $lblHint.BackColor = [System.Drawing.Color]::Transparent
+    $dlg.Controls.Add($lblHint)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'Продолжить'
+    $btnOk.Location = New-Object System.Drawing.Point(472, 590)
+    $btnOk.Size = New-Object System.Drawing.Size(144, 34)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    Set-UiButtonStyle -Button $btnOk -Color $colorBlue -HoverColor ([System.Drawing.Color]::FromArgb(87, 150, 255)) -ForeColor ([System.Drawing.Color]::White) -Bold $true
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Отмена'
+    $btnCancel.Location = New-Object System.Drawing.Point(626, 590)
+    $btnCancel.Size = New-Object System.Drawing.Size(98, 34)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    Set-UiButtonStyle -Button $btnCancel -Color ([System.Drawing.Color]::FromArgb(37, 44, 57)) -HoverColor ([System.Drawing.Color]::FromArgb(51, 61, 78))
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+
+    $script:PreLaunchCameraPopulating = $false
+    $populateCameras = {
+        param([string] $Preferred)
+        $script:PreLaunchCameraPopulating = $true
+        try {
+            $cmbCam.Items.Clear()
+            $cmbCam.Items.Add('Авто') | Out-Null
+            $cams = @(Get-CameraList)
+            foreach ($c in $cams) { $cmbCam.Items.Add($c) | Out-Null }
+            if ($Preferred -and $cmbCam.Items.Contains($Preferred)) {
+                $cmbCam.SelectedItem = $Preferred
+            } else {
+                $cmbCam.SelectedIndex = 0
+            }
+            if ($cams.Count -eq 0) {
+                $lblPreview.Text = 'Камера не обнаружена'
+                $lblPreview.Visible = $true
+            }
+        } finally {
+            $script:PreLaunchCameraPopulating = $false
+        }
+    }
+
+    $getCameraItems = {
+        $items = @()
+        for ($i = 1; $i -lt $cmbCam.Items.Count; $i++) {
+            $items += [string]$cmbCam.Items[$i]
+        }
+        return $items
+    }
+
+    $resolvePreviewCamera = {
+        if ($cmbCam.SelectedIndex -gt 0) { return [string]$cmbCam.SelectedItem }
+        $items = @(& $getCameraItems)
+        if ($items.Count -eq 0) { return $null }
+        $auto = Get-WindowsCameraName
+        if ($auto -and ($items -contains $auto)) { return $auto }
+        return [string]$items[0]
+    }
+
+    $stopPreview = {
+        try { [GoodwinCam.CameraPreview]::Stop() } catch {}
+    }
+
+    $startPreview = {
+        if ($script:PreLaunchCameraPopulating) { return }
+        & $stopPreview
+        $deviceName = & $resolvePreviewCamera
+        if ([string]::IsNullOrWhiteSpace($deviceName)) {
+            $lblPreview.Text = 'Камера не обнаружена'
+            $lblPreview.Visible = $true
+            return
+        }
+        $lblPreview.Text = "Запуск предпросмотра: $deviceName"
+        $lblPreview.Visible = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            [GoodwinCam.CameraPreview]::Start($deviceName, $pnlPreview.Handle, $pnlPreview.ClientSize.Width, $pnlPreview.ClientSize.Height)
+            $lblPreview.Visible = $false
+        } catch {
+            $lblPreview.Text = "Не удалось показать предпросмотр:`r`n$($_.Exception.Message)"
+            $lblPreview.Visible = $true
+        }
+    }
+
+    $populateMicrophones = {
+        param([string] $Preferred)
+        $cmbMic.Items.Clear()
+        $cmbMic.Items.Add('Авто') | Out-Null
+        $mics = @(Get-MicrophoneList)
+        foreach ($m in $mics) { $cmbMic.Items.Add($m) | Out-Null }
+        if ($Preferred -and $cmbMic.Items.Contains($Preferred)) {
+            $cmbMic.SelectedItem = $Preferred
+        } else {
+            $cmbMic.SelectedIndex = 0
+        }
+    }
+
+    $script:PreLaunchMicLevel = 0.0
+    $script:PreLaunchMicCachedName = $null
+    $script:PreLaunchMicCachedId = $null
+
+    $pnlLevel.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $w = $s.ClientSize.Width
+        $h = $s.ClientSize.Height
+        $level = [math]::Min(1.0, [math]::Max(0.0, [double]$script:PreLaunchMicLevel))
+        $filled = [int]($w * $level)
+        if ($filled -le 0) { return }
+        $greenEnd = [int]($w * 0.60)
+        $yellowEnd = [int]($w * 0.85)
+        $brushG = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(80, 200, 80))
+        $brushY = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(220, 200, 60))
+        $brushR = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(220, 80, 80))
+        try {
+            $gFill = [math]::Min($filled, $greenEnd)
+            if ($gFill -gt 0) { $g.FillRectangle($brushG, 0, 0, $gFill, $h) }
+            if ($filled -gt $greenEnd) {
+                $yFill = [math]::Min($filled, $yellowEnd) - $greenEnd
+                if ($yFill -gt 0) { $g.FillRectangle($brushY, $greenEnd, 0, $yFill, $h) }
+            }
+            if ($filled -gt $yellowEnd) {
+                $rFill = $filled - $yellowEnd
+                if ($rFill -gt 0) { $g.FillRectangle($brushR, $yellowEnd, 0, $rFill, $h) }
+            }
+        } finally {
+            $brushG.Dispose(); $brushY.Dispose(); $brushR.Dispose()
+        }
+    })
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 80
+    $timer.Add_Tick({
+        try {
+            $peak = 0.0
+            if ($cmbMic.SelectedIndex -le 0) {
+                $peak = [double][GoodwinCoreAudio.AudioMeter]::GetDefaultCapturePeak()
+            } else {
+                $name = [string]$cmbMic.SelectedItem
+                if ($name -ne $script:PreLaunchMicCachedName) {
+                    $script:PreLaunchMicCachedName = $name
+                    $script:PreLaunchMicCachedId = Get-MicrophoneDeviceIdByName -FriendlyName $name
+                }
+                if ($script:PreLaunchMicCachedId -and $script:PreLaunchMicCachedId -ne 'default') {
+                    $peak = [double][GoodwinCoreAudio.AudioMeter]::GetPeakById($script:PreLaunchMicCachedId)
+                } else {
+                    $peak = [double][GoodwinCoreAudio.AudioMeter]::GetPeakByName($name)
+                }
+            }
+            $script:PreLaunchMicLevel = $peak
+        } catch {
+            $script:PreLaunchMicLevel = 0.0
+        }
+        $pnlLevel.Invalidate()
+    })
+
+    $cmbCam.Add_SelectedIndexChanged({ & $startPreview })
+    $cmbMic.Add_SelectedIndexChanged({
+        $script:PreLaunchMicCachedName = $null
+        $script:PreLaunchMicCachedId = $null
+    })
+    $btnRefreshCam.Add_Click({
+        $preferred = if ($cmbCam.SelectedIndex -gt 0) { [string]$cmbCam.SelectedItem } else { $script:SelectedCamera }
+        & $populateCameras $preferred
+        & $startPreview
+    })
+    $btnRefreshMic.Add_Click({
+        $preferred = if ($cmbMic.SelectedIndex -gt 0) { [string]$cmbMic.SelectedItem } else { $script:SelectedMic }
+        & $populateMicrophones $preferred
+    })
+    $btnSoundTest.Add_Click({
+        $btnSoundTest.Enabled = $false
+        $origText = $btnSoundTest.Text
+        $btnSoundTest.Text = 'Запись...'
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $deviceId = 'default'
+            if ($cmbMic.SelectedIndex -gt 0) {
+                $deviceId = Get-MicrophoneDeviceIdByName -FriendlyName ([string]$cmbMic.SelectedItem)
+            }
+            Start-MicrophoneTest -DurationSec 3 -DeviceId $deviceId
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Не удалось записать/воспроизвести: $($_.Exception.Message)", 'Ошибка', 'OK', 'Error') | Out-Null
+        } finally {
+            $btnSoundTest.Text = $origText
+            $btnSoundTest.Enabled = $true
+        }
+    })
+
+    & $populateCameras $script:SelectedCamera
+    & $populateMicrophones $script:SelectedMic
+
+    $dlg.Add_Shown({
+        & $startPreview
+        $timer.Start()
+    })
+    $dlg.Add_FormClosed({
+        try { $timer.Stop(); $timer.Dispose() } catch {}
+        & $stopPreview
+    })
+
+    try {
+        if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+            return $false
+        }
+
+        if ($cmbCam.SelectedIndex -le 0) {
+            $script:SelectedCamera = $null
+            $txtCamSel.Text = 'Авто'
+        } else {
+            $script:SelectedCamera = [string]$cmbCam.SelectedItem
+            $txtCamSel.Text = $script:SelectedCamera
+        }
+
+        if ($cmbMic.SelectedIndex -le 0) {
+            $script:SelectedMic = $null
+            $txtMicSel.Text = 'Авто'
+        } else {
+            $script:SelectedMic = [string]$cmbMic.SelectedItem
+            $txtMicSel.Text = $script:SelectedMic
+        }
+
+        Save-CurrentSettings
+        Update-OverviewState
+        Write-Step "Проверка устройств завершена: камера=$(if($script:SelectedCamera){$script:SelectedCamera}else{'Авто'}), микрофон=$(if($script:SelectedMic){$script:SelectedMic}else{'Авто'})"
+        return $true
+    } finally {
+        $dlg.Dispose()
+    }
 }
 
 function Set-SettingsFieldClick {
@@ -4881,15 +5504,15 @@ function Show-LogViewerDialog {
 
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = 'Обновить'
-    $btnRefresh.Location = New-Object System.Drawing.Point(542, 526)
+    $btnRefresh.Location = New-Object System.Drawing.Point(516, 526)
     $btnRefresh.Size = New-Object System.Drawing.Size(100, 32)
     Set-UiButtonStyle -Button $btnRefresh -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
     $dlg.Controls.Add($btnRefresh)
 
     $btnOpen = New-Object System.Windows.Forms.Button
     $btnOpen.Text = 'Открыть файл'
-    $btnOpen.Location = New-Object System.Drawing.Point(648, 526)
-    $btnOpen.Size = New-Object System.Drawing.Size(110, 32)
+    $btnOpen.Location = New-Object System.Drawing.Point(624, 526)
+    $btnOpen.Size = New-Object System.Drawing.Size(134, 32)
     Set-UiButtonStyle -Button $btnOpen -Color ([System.Drawing.Color]::FromArgb(47, 55, 70)) -HoverColor ([System.Drawing.Color]::FromArgb(62, 72, 90))
     $dlg.Controls.Add($btnOpen)
 
@@ -5029,6 +5652,11 @@ $btnLaunch.Add_Click({
     $nickname = Show-NicknameDialog
     if ([string]::IsNullOrWhiteSpace($nickname)) {
         Set-Status 'Запуск отменён: ник не указан.' 'Yellow'
+        return
+    }
+
+    if (-not (Show-PreLaunchDeviceCheckDialog)) {
+        Set-Status 'Запуск отменён: проверка устройств не завершена.' 'Yellow'
         return
     }
 
