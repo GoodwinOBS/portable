@@ -73,7 +73,12 @@
             "versioned_id": "dshow_input",
             "settings": {
                 "video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-                "last_video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
+                "last_video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+                "res_type": 1,
+                "resolution": "1280x720",
+                "last_resolution": "1280x720",
+                "undo_uuid": "2891b909-0491-4305-93bf-ef9f39c8e2a0",
+                "deactivate_when_not_showing": true
             },
             "mixers": 0,
             "sync": 0,
@@ -276,7 +281,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "E:/GoodWin/Рамка/RAMA_PROGA_CHERNAYA_NOVAYA1.png",
+                "file": "C:/Users/USER/Downloads/GoodwinOBS/assets/RAMA_PROGA_CHERNAYA_NOVAYA1.png",
                 "undo_uuid": "b47e99a1-93a2-4ef1-b374-2062f46a2f24"
             },
             "mixers": 0,
@@ -331,7 +336,7 @@
             "versioned_id": "scene",
             "settings": {
                 "custom_size": false,
-                "id_counter": 12,
+                "id_counter": 14,
                 "items": [
                     {
                         "name": "Захват экрана",
@@ -684,20 +689,20 @@
                         "id": 7,
                         "group_item_backup": false,
                         "pos": {
-                            "x": -26.0,
-                            "y": 800.0
+                            "x": -34.0,
+                            "y": 795.0
                         },
                         "pos_rel": {
-                            "x": -1.8259259462356567,
-                            "y": 0.4814814329147339
+                            "x": -1.8407407999038696,
+                            "y": 0.4722222089767456
                         },
                         "scale": {
-                            "x": 0.2592604160308838,
-                            "y": 0.25925925374031067
+                            "x": 0.26377952098846436,
+                            "y": 0.2638888955116272
                         },
                         "scale_rel": {
-                            "x": 0.2592604160308838,
-                            "y": 0.25925925374031067
+                            "x": 0.26377952098846436,
+                            "y": 0.2638888955116272
                         },
                         "bounds": {
                             "x": 498.0,
@@ -788,6 +793,8 @@
             "push-to-talk-delay": 0,
             "hotkeys": {
                 "OBSBasic.SelectScene": [],
+                "libobs.show_scene_item.12": [],
+                "libobs.hide_scene_item.12": [],
                 "libobs.show_scene_item.3": [],
                 "libobs.hide_scene_item.3": [],
                 "libobs.show_scene_item.9": [],
@@ -796,14 +803,12 @@
                 "libobs.hide_scene_item.8": [],
                 "libobs.show_scene_item.2": [],
                 "libobs.hide_scene_item.2": [],
-                "libobs.show_scene_item.7": [],
-                "libobs.hide_scene_item.7": [],
                 "libobs.show_scene_item.10": [],
                 "libobs.hide_scene_item.10": [],
+                "libobs.show_scene_item.7": [],
+                "libobs.hide_scene_item.7": [],
                 "libobs.show_scene_item.11": [],
-                "libobs.hide_scene_item.11": [],
-                "libobs.show_scene_item.12": [],
-                "libobs.hide_scene_item.12": []
+                "libobs.hide_scene_item.11": []
             },
             "deinterlace_mode": 0,
             "deinterlace_field_order": 0,
@@ -828,7 +833,7 @@
     "saved_projectors": [],
     "preview_locked": false,
     "scaling_enabled": false,
-    "scaling_level": -10,
+    "scaling_level": -2,
     "scaling_off_x": 0.0,
     "scaling_off_y": 0.0,
     "virtual-camera": {
