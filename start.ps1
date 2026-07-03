@@ -199,7 +199,7 @@ $script:SettingsFile      = Join-Path $env:APPDATA 'goodwin_obs\settings.json'
 $script:UploadHistoryFile = Join-Path $env:APPDATA 'goodwin_obs\uploaded.json'
 $script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
 $script:UploadProgressActive = $false
-$script:DebugVersion = 'debug-2026-07-03.1'
+$script:DebugVersion = 'debug-2026-07-03.2'
 $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
 $TempRoot = Join-Path $InstallDir '.tmp_install'
 $script:PortableRepoOwner = 'GoodwinOBS'
@@ -1251,8 +1251,15 @@ function Set-ObsDeviceSettings {
     } else {
         $cameraName = Get-WindowsCameraName
     }
+    $cameraDeviceId = $null
     if ($cameraName) {
-        $cameraSettings = [pscustomobject]@{ video_device_id = $cameraName }
+        $cameraDeviceId = Get-CameraDeviceIdByName $cameraName
+    }
+    if ($cameraDeviceId) {
+        $cameraSettings = [pscustomobject]@{
+            video_device_id      = $cameraDeviceId
+            last_video_device_id = $cameraDeviceId
+        }
     }
 
     foreach ($sceneFile in $sceneFiles) {
@@ -1321,7 +1328,7 @@ function Set-ObsDeviceSettings {
     }
 
     if ($cameraSettings) {
-        Write-Log "Камера настроена: $cameraName"
+        Write-Log "Камера настроена: $cameraName [$cameraDeviceId]"
     } else {
         Write-Log 'Камера не обнаружена — используются настройки из пакета'
     }
@@ -3354,6 +3361,19 @@ namespace GoodwinCam {
         // (через DirectShow System Device Enumerator).
         public static string[] EnumerateVideoDevices() {
             var result = new System.Collections.Generic.List<string>();
+            foreach (string entry in EnumerateVideoDeviceEntries()) {
+                int sep = entry.IndexOf('|');
+                if (sep > 0) {
+                    result.Add(entry.Substring(0, sep));
+                }
+            }
+            return result.ToArray();
+        }
+
+        // Формат строки: FriendlyName|DevicePath. OBS сохраняет dshow_input как
+        // FriendlyName:DevicePath, одного FriendlyName недостаточно.
+        public static string[] EnumerateVideoDeviceEntries() {
+            var result = new System.Collections.Generic.List<string>();
             object devEnum = null;
             try {
                 devEnum = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_SystemDeviceEnum));
@@ -3370,11 +3390,14 @@ namespace GoodwinCam {
                                 arr[0].BindToStorage(null, null, ref bagIid, out bagObj);
                                 IPropertyBag bag = (IPropertyBag)bagObj;
                                 object friendly = null;
+                                object devicePath = null;
                                 bag.Read("FriendlyName", ref friendly, IntPtr.Zero);
+                                try { bag.Read("DevicePath", ref devicePath, IntPtr.Zero); } catch { }
                                 Marshal.ReleaseComObject(bag);
                                 string fn = friendly as string;
+                                string path = devicePath as string;
                                 if (!string.IsNullOrEmpty(fn)) {
-                                    result.Add(fn);
+                                    result.Add(fn + "|" + (path ?? ""));
                                 }
                             } catch { }
                             Marshal.ReleaseComObject(arr[0]);
@@ -3495,13 +3518,44 @@ function Get-CameraList {
     # Возвращаем имена видеовходов, которые отдаёт DirectShow System Device Enumerator —
     # ровно то же, что показывает OBS (DroidCam, FIFINE, встроенная веб-камера, и т.д.).
     # Виртуальные камеры (OBS Virtual Camera) намеренно НЕ скрываем, потому что OBS их тоже показывает.
-    $list = @()
+    $list = @((Get-CameraDeviceMap).Keys)
+    return $list | Where-Object { $_ } | Sort-Object -Unique
+}
+
+function Get-CameraDeviceMap {
+    # Возвращает [ordered] @{ FriendlyName = "FriendlyName:DevicePath" }.
+    # OBS DirectShow не принимает одно только FriendlyName: нужен полный id устройства.
+    $map = [ordered]@{}
     try {
-        $list = @([GoodwinCam.CameraPreview]::EnumerateVideoDevices())
+        $entries = @([GoodwinCam.CameraPreview]::EnumerateVideoDeviceEntries())
+        foreach ($line in $entries) {
+            if (-not $line) { continue }
+            $sep = $line.IndexOf('|')
+            if ($sep -lt 0) { continue }
+            $name = $line.Substring(0, $sep)
+            $path = $line.Substring($sep + 1)
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+            $deviceId = if ([string]::IsNullOrWhiteSpace($path)) { $name } else { "${name}:${path}" }
+            $key = $name
+            $i = 2
+            while ($map.Contains($key)) { $key = "$name #$i"; $i++ }
+            $map[$key] = $deviceId
+        }
     } catch {
         Write-Log "Перечисление камер не удалось: $($_.Exception.Message)"
     }
-    return $list | Where-Object { $_ } | Sort-Object -Unique
+    return $map
+}
+
+function Get-CameraDeviceIdByName {
+    param([string] $FriendlyName)
+    if ([string]::IsNullOrWhiteSpace($FriendlyName)) { return $null }
+    $map = Get-CameraDeviceMap
+    if ($map.Contains($FriendlyName)) { return $map[$FriendlyName] }
+    $hit = $map.Keys | Where-Object { $_ -like "*$FriendlyName*" } | Select-Object -First 1
+    if ($hit) { return $map[$hit] }
+    return $FriendlyName
 }
 
 function Get-MicrophoneList {
