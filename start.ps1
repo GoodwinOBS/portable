@@ -63,6 +63,22 @@ $script:IsBusy = $false
 # Загружаем System.Net.Http один раз (для chunked upload)
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
+$script:GoodwinBootstrapLogFile = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
+$script:GoodwinBootstrapScriptUrl = 'https://raw.githubusercontent.com/GoodwinOBS/portable/main/start.ps1'
+
+function Write-GoodwinBootstrapLog {
+    param([string] $Message)
+    try {
+        $dir = Split-Path -Parent $script:GoodwinBootstrapLogFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+        $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message
+        Add-Content -Path $script:GoodwinBootstrapLogFile -Value $line -Encoding UTF8
+    }
+    catch {}
+}
+
 # Проверка STA-режима для WinForms и прав администратора.
 function Test-GoodwinAdministrator {
     try {
@@ -79,6 +95,22 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
     param([AllowNull()][string] $Value)
     if ($null -eq $Value) { return "''" }
     return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Save-GoodwinRestartScript {
+    param([Parameter(Mandatory = $true)][string] $ScriptPath)
+
+    Write-GoodwinBootstrapLog "Bootstrap: downloading restart script from $script:GoodwinBootstrapScriptUrl"
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+    $wc = New-Object Net.WebClient
+    $wc.Encoding = New-Object System.Text.UTF8Encoding($false)
+    $scriptContent = $wc.DownloadString($script:GoodwinBootstrapScriptUrl)
+    if ([string]::IsNullOrWhiteSpace($scriptContent)) {
+        throw 'Downloaded restart script is empty.'
+    }
+    $scriptContent = $scriptContent.TrimStart([char]0xFEFF)
+    [IO.File]::WriteAllText($ScriptPath, $scriptContent, (New-Object System.Text.UTF8Encoding($true)))
+    Write-GoodwinBootstrapLog "Bootstrap: restart script saved to $ScriptPath"
 }
 
 function Start-GoodwinRestart {
@@ -98,28 +130,44 @@ function Start-GoodwinRestart {
 
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $arguments = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand)
+    Write-GoodwinBootstrapLog "Bootstrap: launching restart elevated=$Elevated script=$ScriptPath"
     if ($Elevated) {
-        Start-Process powershell.exe -Verb RunAs -WindowStyle Minimized -ArgumentList $arguments
+        Start-Process -FilePath powershell.exe -Verb RunAs -WindowStyle Minimized -ArgumentList $arguments
     } else {
-        Start-Process powershell.exe -WindowStyle Minimized -ArgumentList $arguments
+        Start-Process -FilePath powershell.exe -WindowStyle Minimized -ArgumentList $arguments
     }
 }
 
 $needsSta = ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA')
 $needsAdmin = -not (Test-GoodwinAdministrator)
+Write-GoodwinBootstrapLog "Bootstrap: pid=$PID admin=$(-not $needsAdmin) sta=$(-not $needsSta)"
 if ($needsSta -or $needsAdmin) {
-    $scriptPath = $MyInvocation.MyCommand.Path
-    if (-not $scriptPath) {
+    $restartScriptPath = $PSCommandPath
+    if (-not $restartScriptPath) { $restartScriptPath = $MyInvocation.MyCommand.Path }
+    if (-not $restartScriptPath -and (Get-Variable -Name scriptPath -Scope Local -ErrorAction SilentlyContinue)) {
+        $candidateScriptPath = (Get-Variable -Name scriptPath -Scope Local -ErrorAction SilentlyContinue).Value
+        if ($candidateScriptPath -and (Test-Path -LiteralPath $candidateScriptPath)) {
+            $restartScriptPath = $candidateScriptPath
+        }
+    }
+    if (-not $restartScriptPath) {
         # Запуск через irm | iex — сохраняем скрипт в штатную директорию.
         $restartDir = Join-Path $env:USERPROFILE 'Downloads\GoodwinOBS'
         New-Item -ItemType Directory -Force -Path $restartDir | Out-Null
-        $scriptPath = Join-Path $restartDir 'goodwin_obs.ps1'
-        $scriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
-        [IO.File]::WriteAllText($scriptPath, $scriptContent, (New-Object System.Text.UTF8Encoding($true)))
+        $restartScriptPath = Join-Path $restartDir 'goodwin_obs.ps1'
+        Save-GoodwinRestartScript -ScriptPath $restartScriptPath
     }
-    if (Test-Path -LiteralPath $scriptPath) {
-        Start-GoodwinRestart -ScriptPath $scriptPath -Elevated $needsAdmin
-        exit
+    if (Test-Path -LiteralPath $restartScriptPath) {
+        try {
+            Write-GoodwinBootstrapLog "Bootstrap: restart required needsAdmin=$needsAdmin needsSta=$needsSta"
+            Start-GoodwinRestart -ScriptPath $restartScriptPath -Elevated $needsAdmin
+            exit
+        }
+        catch {
+            Write-GoodwinBootstrapLog "Bootstrap: restart failed: $($_.Exception.Message)"
+            Write-Host "Goodwin OBS restart failed: $($_.Exception.Message)"
+            exit 1
+        }
     } else {
         Write-Host 'Запустите скрипт от имени администратора в STA-режиме: powershell -STA -ExecutionPolicy Bypass -File goodwin_obs.ps1'
         exit
@@ -151,7 +199,7 @@ $script:SettingsFile      = Join-Path $env:APPDATA 'goodwin_obs\settings.json'
 $script:UploadHistoryFile = Join-Path $env:APPDATA 'goodwin_obs\uploaded.json'
 $script:LogFile           = Join-Path $env:APPDATA 'goodwin_obs\goodwin_obs.log'
 $script:UploadProgressActive = $false
-$script:DebugVersion = 'debug-2026-07-01.3'
+$script:DebugVersion = 'debug-2026-07-03.1'
 $ObsApiUrl = 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'
 $TempRoot = Join-Path $InstallDir '.tmp_install'
 $script:PortableRepoOwner = 'GoodwinOBS'
@@ -5979,6 +6027,13 @@ try {
 
 Write-Log 'Goodwin OBS запущен'
 Write-Step "Debug версия программы: $script:DebugVersion"
+try {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    Write-Log ("Process status: elevatedAdmin={0}; user={1}; pid={2}; sta={3}" -f (Test-GoodwinAdministrator), $identity.Name, $PID, ([Threading.Thread]::CurrentThread.GetApartmentState()))
+}
+catch {
+    Write-Log ("Process status: elevatedAdmin={0}; pid={1}; sta={2}" -f (Test-GoodwinAdministrator), $PID, ([Threading.Thread]::CurrentThread.GetApartmentState()))
+}
 if ($script:SelectedNickname -and $script:SelectedNickname -ne 'untitled') {
     Write-Step "Загружены настройки: никнейм = $script:SelectedNickname"
 }
