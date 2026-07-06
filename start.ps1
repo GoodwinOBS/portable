@@ -1578,6 +1578,7 @@ function Set-ActiveObsProfile {
     $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'SceneCollection' -Value $sceneCollectionName
     $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'SceneCollectionFile' -Value $sceneCollectionFile
     $lines = Set-IniValue -Lines $lines -Section 'Basic' -Key 'ConfigOnNewProfile' -Value 'true'
+    $lines = Set-IniValue -Lines $lines -Section 'BasicWindow' -Key 'VerticalVolumeControl' -Value 'true'
 
     Write-LinesFileAtomic -Path $userIni -Lines $lines
     Write-Step "Установлен профиль: $profileName"

@@ -72,13 +72,11 @@
             "id": "dshow_input",
             "versioned_id": "dshow_input",
             "settings": {
-                "video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-                "last_video_device_id": "Cam Link 4K:\\\\?\\usb#22vid_0fd9&pid_007b&mi_00#227&3951e035&0&0000#22{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+                "video_device_id": "Cam Link 4K:\\\\?\\usb#vid_0fd9&pid_007b&mi_00#7&3951e035&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+                "last_video_device_id": "Cam Link 4K:\\\\?\\usb#vid_0fd9&pid_007b&mi_00#7&3951e035&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
                 "res_type": 1,
-                "resolution": "1280x720",
-                "last_resolution": "1280x720",
-                "undo_uuid": "2891b909-0491-4305-93bf-ef9f39c8e2a0",
-                "deactivate_when_not_showing": true
+                "resolution": "1920x1080",
+                "last_resolution": "1920x1080"
             },
             "mixers": 0,
             "sync": 0,
@@ -341,7 +339,7 @@
                     {
                         "name": "Захват экрана",
                         "source_uuid": "30fdc211-8c6f-4980-add4-7e331fc275ea",
-                        "visible": false,
+                        "visible": true,
                         "locked": false,
                         "rot": 0.0,
                         "scale_ref": {
@@ -349,7 +347,7 @@
                             "y": 1080.0
                         },
                         "align": 5,
-                        "bounds_type": 0,
+                        "bounds_type": 1,
                         "bounds_align": 0,
                         "bounds_crop": false,
                         "crop_left": 0,
@@ -375,12 +373,12 @@
                             "y": 1.0
                         },
                         "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 1920.0,
+                            "y": 1080.0
                         },
                         "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 3.555555582046509,
+                            "y": 2.0
                         },
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -459,7 +457,7 @@
                             "y": 1080.0
                         },
                         "align": 5,
-                        "bounds_type": 0,
+                        "bounds_type": 1,
                         "bounds_align": 0,
                         "bounds_crop": false,
                         "crop_left": 0,
@@ -485,12 +483,12 @@
                             "y": 1.0
                         },
                         "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 1920.0,
+                            "y": 1080.0
                         },
                         "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 3.555555582046509,
+                            "y": 2.0
                         },
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -514,7 +512,7 @@
                             "y": 1080.0
                         },
                         "align": 5,
-                        "bounds_type": 0,
+                        "bounds_type": 1,
                         "bounds_align": 0,
                         "bounds_crop": false,
                         "crop_left": 0,
@@ -540,12 +538,12 @@
                             "y": 0.75
                         },
                         "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 1920.0,
+                            "y": 1080.0
                         },
                         "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 3.555555582046509,
+                            "y": 2.0
                         },
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -624,7 +622,7 @@
                             "y": 1080.0
                         },
                         "align": 5,
-                        "bounds_type": 0,
+                        "bounds_type": 1,
                         "bounds_align": 0,
                         "bounds_crop": false,
                         "crop_left": 0,
@@ -650,12 +648,12 @@
                             "y": 1.0
                         },
                         "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 1920.0,
+                            "y": 1080.0
                         },
                         "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 3.555555582046509,
+                            "y": 2.0
                         },
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -679,38 +677,38 @@
                             "y": 1080.0
                         },
                         "align": 5,
-                        "bounds_type": 0,
+                        "bounds_type": 1,
                         "bounds_align": 5,
                         "bounds_crop": false,
-                        "crop_left": 0,
+                        "crop_left": 118,
                         "crop_top": 0,
                         "crop_right": 142,
                         "crop_bottom": 0,
                         "id": 7,
                         "group_item_backup": false,
                         "pos": {
-                            "x": -34.0,
+                            "x": -3.0,
                             "y": 795.0
                         },
                         "pos_rel": {
-                            "x": -1.8407407999038696,
+                            "x": -1.7833333015441895,
                             "y": 0.4722222089767456
                         },
                         "scale": {
-                            "x": 0.26377952098846436,
-                            "y": 0.2638888955116272
+                            "x": 1.0,
+                            "y": 1.0
                         },
                         "scale_rel": {
-                            "x": 0.26377952098846436,
-                            "y": 0.2638888955116272
+                            "x": 1.0,
+                            "y": 1.0
                         },
                         "bounds": {
-                            "x": 498.0,
-                            "y": 280.0
+                            "x": 438.0,
+                            "y": 285.0
                         },
                         "bounds_rel": {
-                            "x": 0.9222221970558167,
-                            "y": 0.5185185074806213
+                            "x": 0.8111110925674438,
+                            "y": 0.5277777910232544
                         },
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -734,7 +732,7 @@
                             "y": 1080.0
                         },
                         "align": 5,
-                        "bounds_type": 0,
+                        "bounds_type": 1,
                         "bounds_align": 0,
                         "bounds_crop": false,
                         "crop_left": 0,
@@ -760,12 +758,12 @@
                             "y": 1.0
                         },
                         "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 1920.0,
+                            "y": 1080.0
                         },
                         "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
+                            "x": 3.555555582046509,
+                            "y": 2.0
                         },
                         "scale_filter": "disable",
                         "blend_method": "default",
@@ -833,7 +831,7 @@
     "saved_projectors": [],
     "preview_locked": false,
     "scaling_enabled": false,
-    "scaling_level": -2,
+    "scaling_level": -6,
     "scaling_off_x": 0.0,
     "scaling_off_y": 0.0,
     "virtual-camera": {
